@@ -208,7 +208,7 @@ See the [event contract](development/architecture/telemetry.md#mxcexecutionstart
 
 ## Lifecycle session correlation
 
-All 12 event types include `mxc.session_id`, a lowercase hyphenated UUID
+All 11 event types include `mxc.session_id`, a lowercase hyphenated UUID
 such as `7c54602b-e604-45ca-9a7a-e59bc86a6167` (illustrative only). One container
 lifecycle shares the ID across provision, start, repeated exec calls, stop, and
 deprovision, including separate executor processes. Each create-and-run execution
@@ -236,4 +236,5 @@ still requires privacy and release-owner review before shipping.
 ## See also
 
 - [Telemetry architecture](development/architecture/telemetry.md)
+- [Lifecycle correlation](development/architecture/telemetry.md#correlating-a-lifecycle)
 - [Telemetry consent design](development/architecture/telemetry-consent-design.md)

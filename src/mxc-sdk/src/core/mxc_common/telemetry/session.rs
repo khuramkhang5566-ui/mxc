@@ -15,38 +15,43 @@ use super::LearningMode;
 use crate::mxc_common::logger::Logger;
 
 thread_local! {
-    static CURRENT: Cell<Option<Uuid>> = const { Cell::new(None) };
-    static DISABLED: Cell<bool> = const { Cell::new(false) };
-    static LEARNING_MODE: Cell<LearningMode> = const { Cell::new(LearningMode::NotApplicable) };
+    static CURRENT: Cell<Option<SessionContext>> = const { Cell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ProcessContext {
+pub(crate) struct SessionContext {
     session_id: Option<Uuid>,
     learning_mode: LearningMode,
+    disabled: bool,
 }
 
-static PROCESS_CONTEXT: Mutex<Option<ProcessContext>> = Mutex::new(None);
+impl SessionContext {
+    pub(crate) fn suppressed() -> Self {
+        Self {
+            session_id: None,
+            learning_mode: LearningMode::NotApplicable,
+            disabled: true,
+        }
+    }
+}
+
+static PROCESS_CONTEXT: Mutex<Option<SessionContext>> = Mutex::new(None);
 
 /// Restores the calling thread's attribution on return or unwind.
 ///
 /// This guard cannot move to another thread. Streaming handles retain only
-/// the copyable ID/mode and install a new guard wherever they are subsequently used.
+/// the copyable context and install a new guard wherever they are subsequently used.
 #[doc(hidden)]
 #[derive(Debug)]
 #[must_use = "retain the scope until invocation processing finishes"]
 pub struct SessionScope {
-    previous: Option<Uuid>,
-    previously_disabled: bool,
-    previous_learning_mode: LearningMode,
+    previous: Option<SessionContext>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
 impl Drop for SessionScope {
     fn drop(&mut self) {
         CURRENT.with(|slot| slot.set(self.previous));
-        DISABLED.with(|slot| slot.set(self.previously_disabled));
-        LEARNING_MODE.with(|slot| slot.set(self.previous_learning_mode));
     }
 }
 
@@ -65,7 +70,7 @@ pub fn start_with_learning_mode(
     logger: &mut Logger,
 ) -> SessionScope {
     if !active {
-        return install(None, true, LearningMode::NotApplicable);
+        return resume(SessionContext::suppressed());
     }
     let id = if vector.is_empty() {
         random_id()
@@ -81,7 +86,11 @@ pub fn start_with_learning_mode(
             None
         }
     };
-    install(id, false, learning_mode)
+    resume(SessionContext {
+        session_id: id,
+        learning_mode,
+        disabled: false,
+    })
 }
 
 fn random_id() -> Result<Uuid, &'static str> {
@@ -102,29 +111,31 @@ pub(crate) fn from_vector(vector: &str) -> Option<Uuid> {
     (length == bytes.len()).then(|| uuid::Builder::from_random_bytes(bytes).into_uuid())
 }
 
-fn install(id: Option<Uuid>, disabled: bool, learning_mode: LearningMode) -> SessionScope {
-    SessionScope {
-        previous: CURRENT.with(|slot| slot.replace(id)),
-        previously_disabled: DISABLED.with(|slot| slot.replace(disabled)),
-        previous_learning_mode: LEARNING_MODE.with(|slot| slot.replace(learning_mode)),
-        _thread_bound: PhantomData,
-    }
+pub(crate) fn capture() -> SessionContext {
+    CURRENT.with(Cell::get).unwrap_or(SessionContext {
+        session_id: None,
+        learning_mode: LearningMode::NotApplicable,
+        disabled: false,
+    })
 }
 
 pub(crate) fn current() -> Option<Uuid> {
-    CURRENT.with(Cell::get)
+    capture().session_id
 }
 
 pub(crate) fn invocation_disabled() -> bool {
-    DISABLED.with(Cell::get)
+    capture().disabled
 }
 
 pub(crate) fn learning_mode() -> LearningMode {
-    LEARNING_MODE.with(Cell::get)
+    capture().learning_mode
 }
 
-pub(crate) fn resume(id: Option<Uuid>, learning_mode: LearningMode) -> SessionScope {
-    install(id, id.is_none(), learning_mode)
+pub(crate) fn resume(context: SessionContext) -> SessionScope {
+    SessionScope {
+        previous: CURRENT.with(|slot| slot.replace(Some(context))),
+        _thread_bound: PhantomData,
+    }
 }
 
 pub(crate) fn wire_id(buffer: &mut [u8; 36]) -> &str {
@@ -139,25 +150,14 @@ pub(super) fn remember_process() {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if slot.is_none() {
-        *slot = Some(ProcessContext {
-            session_id: current(),
-            learning_mode: learning_mode(),
-        });
+        *slot = Some(capture());
     }
 }
 
 pub(super) fn resume_process() -> SessionScope {
-    let current_id = current();
     let stored = PROCESS_CONTEXT.try_lock().ok().and_then(|slot| *slot);
-    let id = current_id.or_else(|| stored.and_then(|context| context.session_id));
-    let mode = if current_id.is_some() {
-        learning_mode()
-    } else {
-        stored
-            .map(|context| context.learning_mode)
-            .unwrap_or_else(learning_mode)
-    };
-    install(id, false, mode)
+    let context = CURRENT.with(Cell::get).or(stored).unwrap_or_else(capture);
+    resume(context)
 }
 
 #[cfg(test)]
@@ -249,10 +249,11 @@ mod tests {
         let mut logger = Logger::new(Mode::Buffer);
         let _scope = start(true, "", &mut logger);
         let id = current().expect("random session");
+        let context = capture();
         std::thread::spawn(move || {
             assert_eq!(current(), None);
             {
-                let _scope = resume(Some(id), LearningMode::NotApplicable);
+                let _scope = resume(context);
                 assert_eq!(current(), Some(id));
                 let mut buffer = [0; 36];
                 assert_eq!(wire_id(&mut buffer), id.to_string());
@@ -262,6 +263,73 @@ mod tests {
         .join()
         .expect("worker completed");
         assert_eq!(current(), Some(id));
+    }
+
+    #[test]
+    fn context_transfer_preserves_suppression_separately_from_missing_attribution() {
+        for active in [false, true] {
+            let mut logger = Logger::new(Mode::Buffer);
+            let _scope =
+                start_with_learning_mode(active, "invalid", LearningMode::Learning, &mut logger);
+            assert_eq!(current(), None);
+            let context = capture();
+            std::thread::spawn(move || {
+                let mut logger = Logger::new(Mode::Buffer);
+                let _outer = start_with_learning_mode(
+                    true,
+                    "",
+                    LearningMode::PermissiveLearning,
+                    &mut logger,
+                );
+                let outer_id = current();
+                {
+                    let _restored = resume(context);
+                    assert_eq!(current(), None);
+                    assert_eq!(invocation_disabled(), !active);
+                    assert_eq!(
+                        learning_mode(),
+                        if active {
+                            LearningMode::Learning
+                        } else {
+                            LearningMode::NotApplicable
+                        }
+                    );
+                    assert_eq!(wire_id(&mut [0; 36]), "unknown");
+                }
+                assert_eq!(current(), outer_id);
+                assert!(!invocation_disabled());
+                assert_eq!(learning_mode(), LearningMode::PermissiveLearning);
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn process_recovery_preserves_an_installed_invocation_without_attribution() {
+        let _lock = super::super::events::test_sink::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_process();
+        let mut logger = Logger::new(Mode::Buffer);
+        {
+            let _owner = start_with_learning_mode(true, "", LearningMode::Learning, &mut logger);
+            remember_process();
+        }
+        for active in [false, true] {
+            let _invocation = start_with_learning_mode(
+                active,
+                "invalid",
+                LearningMode::PermissiveLearning,
+                &mut logger,
+            );
+            let expected_mode = learning_mode();
+            let _recovered = resume_process();
+            assert_eq!(current(), None);
+            assert_eq!(invocation_disabled(), !active);
+            assert_eq!(learning_mode(), expected_mode);
+        }
+        reset_process();
     }
 
     #[test]

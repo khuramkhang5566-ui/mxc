@@ -33,8 +33,6 @@ mod backend_registry;
 mod dispatch;
 mod error;
 mod experimental;
-#[cfg(target_os = "windows")]
-mod guarded_capture;
 mod platform;
 mod probe;
 #[cfg(target_os = "windows")]
@@ -52,10 +50,6 @@ pub use platform::{platform_support, BubblewrapNetworkSupport, PlatformSupport, 
 pub use probe::{available_backends, to_json_pretty, AvailableBackend, BackendCapability};
 #[cfg(target_os = "windows")]
 pub use request_probe::{probe_execution_request, ProbeFacts, ProbeOutput, UiCapabilitySupport};
-#[cfg(target_os = "windows")]
-pub fn guarded_capture_available() -> bool {
-    guarded_capture::is_available()
-}
 #[cfg(target_os = "windows")]
 pub use run::resolve_runner_for_audit;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -286,8 +280,7 @@ impl Drop for TelemetryRegistration {
 /// reference.
 struct TelemetryProcess {
     inner: Option<Box<dyn SandboxProcess>>,
-    session_id: Option<uuid::Uuid>,
-    learning_mode: telemetry::LearningMode,
+    session_context: telemetry::session::SessionContext,
     // Disabled wrappers still suppress backend attribution when another request
     // owns the shared provider, but otherwise preserve the raw process behavior.
     enabled: bool,
@@ -346,11 +339,10 @@ impl TelemetryProcess {
         let warnings = inner.warnings().to_vec();
         Self {
             inner: Some(inner),
-            session_id: active.then(telemetry::session::current).flatten(),
-            learning_mode: if active {
-                telemetry::session::learning_mode()
+            session_context: if active {
+                telemetry::session::capture()
             } else {
-                telemetry::LearningMode::NotApplicable
+                telemetry::session::SessionContext::suppressed()
             },
             enabled: active,
             active,
@@ -589,7 +581,7 @@ fn observe_before_drop(process: &mut dyn SandboxProcess) -> DropDisposition {
 
 impl Drop for TelemetryProcess {
     fn drop(&mut self) {
-        let _session = telemetry::session::resume(self.session_id, self.learning_mode);
+        let _session = telemetry::session::resume(self.session_context);
         // If `wait` / `try_wait(Ok(Some))` / `kill` already emitted the
         // terminal event, `active` is false and this is a no-op. Otherwise,
         // preserve a completion that raced with Drop instead of misreporting a
@@ -677,7 +669,7 @@ impl SandboxProcess for TelemetryProcess {
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        let _session = telemetry::session::resume(self.session_id, self.learning_mode);
+        let _session = telemetry::session::resume(self.session_context);
         let result = match self.inner_mut().try_wait() {
             Ok(Some(_)) if self.timeout_requested => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -711,7 +703,7 @@ impl SandboxProcess for TelemetryProcess {
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
-        let _session = telemetry::session::resume(self.session_id, self.learning_mode);
+        let _session = telemetry::session::resume(self.session_context);
         // A failed kill does not prove termination, so retain the exactly-once
         // slot for a later wait/try_wait that can report the real outcome.
         let result = self.inner_mut().kill();
@@ -722,7 +714,7 @@ impl SandboxProcess for TelemetryProcess {
     }
 
     fn kill_for_timeout(&mut self) -> std::io::Result<()> {
-        let _session = telemetry::session::resume(self.session_id, self.learning_mode);
+        let _session = telemetry::session::resume(self.session_context);
         if self.enabled {
             self.timeout_requested = true;
         }
@@ -737,7 +729,7 @@ impl SandboxProcess for TelemetryProcess {
     }
 
     fn wait(&mut self) -> std::io::Result<i32> {
-        let _session = telemetry::session::resume(self.session_id, self.learning_mode);
+        let _session = telemetry::session::resume(self.session_context);
         let result = match self.inner_mut().wait() {
             Ok(_) if self.timeout_requested => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -1167,12 +1159,17 @@ mod telemetry_process_tests {
     struct SessionProbe {
         expected: Option<uuid::Uuid>,
         expected_learning_mode: telemetry::LearningMode,
+        expected_disabled: bool,
         calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     impl SessionProbe {
         fn record(&self, operation: &'static str) {
             assert_eq!(telemetry::session::current(), self.expected);
+            assert_eq!(
+                telemetry::session::invocation_disabled(),
+                self.expected_disabled
+            );
             assert_eq!(
                 telemetry::session::learning_mode(),
                 self.expected_learning_mode
@@ -1220,20 +1217,26 @@ mod telemetry_process_tests {
 
     #[test]
     fn moved_handle_restores_its_session_for_backend_operations_and_final_drop() {
-        for enabled in [false, true] {
+        for (enabled, vector) in [(false, ""), (true, ""), (true, "invalid")] {
             let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let expected_id;
             let mut process = {
                 let mut logger = Logger::new(Mode::Buffer);
                 let _scope = telemetry::session::start_with_learning_mode(
                     true,
-                    "",
+                    vector,
                     telemetry::LearningMode::PermissiveLearning,
                     &mut logger,
                 );
-                let expected = telemetry::session::current().unwrap();
+                expected_id = if enabled {
+                    telemetry::session::current()
+                } else {
+                    None
+                };
                 TelemetryProcess::new(
                     Box::new(SessionProbe {
-                        expected: enabled.then_some(expected),
+                        expected: expected_id,
+                        expected_disabled: !enabled,
                         expected_learning_mode: if enabled {
                             telemetry::LearningMode::PermissiveLearning
                         } else {
@@ -1263,7 +1266,7 @@ mod telemetry_process_tests {
                     &mut logger,
                 );
                 let unrelated = telemetry::session::current();
-                assert_ne!(unrelated, process.session_id);
+                assert_ne!(unrelated, expected_id);
                 assert_eq!(process.try_wait().unwrap(), None);
                 assert_eq!(telemetry::session::current(), unrelated);
                 assert_eq!(
