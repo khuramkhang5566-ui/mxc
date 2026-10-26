@@ -94,10 +94,8 @@ impl SandboxBackend for BubblewrapScriptRunner {
         stdio: StdioMode,
     ) -> Result<Box<dyn SandboxProcess>, ScriptResponse> {
         validate_common(request)?;
-        // Keep the plan validation derived so the firewall path installs
-        // exactly what was accepted instead of deriving it again.
-        let egress_plan = self.validate_prepared(request)?;
-        if let Some(plan) = egress_plan.as_ref() {
+        let launch = self.validate_prepared(request)?;
+        if let Some(plan) = launch.egress_plan.as_ref() {
             warn_unreachable_v6_targets(plan, logger);
         }
         // Tighten aliases of the same host object to the strictest intent
@@ -152,20 +150,26 @@ impl SandboxBackend for BubblewrapScriptRunner {
         }
         warn_resolver_mount_hint(request, logger);
         warn_cwd_mount_hint(request, logger);
-        let child = self.spawn_bwrap(request, &plan.files, egress_plan, logger, stdio)?;
+        let child = self.spawn_bwrap(request, &plan.files, launch, logger, stdio)?;
         Ok(Box::new(BubblewrapSandboxProcess::new(child)))
     }
 }
 
+/// What validation checked, so the launch runs exactly that instead of looking
+/// it up or deriving it again.
+#[derive(Debug)]
+struct ValidatedLaunch {
+    egress_plan: Option<network_rules::EgressPlan>,
+    bwrap: PathBuf,
+    network_tools: Option<proxy_network::NetworkTools>,
+}
+
 impl BubblewrapScriptRunner {
-    /// `validate`, plus the egress plan it derived.
-    ///
-    /// Returning the plan lets `spawn` install exactly what validation
-    /// accepted instead of deriving it a second time on every spawn.
+    /// `validate`, plus the egress plan and host tools it checked.
     fn validate_prepared(
         &self,
         request: &ExecutionRequest,
-    ) -> Result<Option<network_rules::EgressPlan>, ScriptResponse> {
+    ) -> Result<ValidatedLaunch, ScriptResponse> {
         // Execution validation deliberately bypasses the advisory success
         // cache: a prior platform-support query must not approve a different
         // executable after `PATH` or its contents change.
@@ -181,9 +185,9 @@ impl BubblewrapScriptRunner {
         &self,
         request: &ExecutionRequest,
         probe: F,
-    ) -> Result<Option<network_rules::EgressPlan>, ScriptResponse>
+    ) -> Result<ValidatedLaunch, ScriptResponse>
     where
-        F: FnOnce() -> Result<bwrap_version::BwrapVersion, bwrap_version::BwrapUnavailable>,
+        F: FnOnce() -> Result<bwrap_version::ProbedBwrap, bwrap_version::BwrapUnavailable>,
     {
         validate_network_policy_support(request, self.network_policy_support())?;
 
@@ -288,10 +292,8 @@ impl BubblewrapScriptRunner {
         // `bwrap` must be present *and* new enough for every flag the argument
         // builder emits — an old binary would otherwise fail at spawn time with
         // an opaque "unknown option" error.
-        if let Err(err) = probe() {
-            return Err(ScriptResponse::error(&err.to_string()));
-        }
-        if proxy_only || firewall_enforced {
+        let bwrap = probe().map_err(|err| ScriptResponse::error(&err.to_string()))?;
+        let network_tools = if proxy_only || firewall_enforced {
             // Proxy and firewall are mutually exclusive, so this names the one
             // the caller actually asked for.
             let use_case = if proxy_only {
@@ -299,12 +301,19 @@ impl BubblewrapScriptRunner {
             } else {
                 proxy_network::PrivateNetworkUse::FirewallEnforcement
             };
-            if let Err(error) = proxy_network::probe_dependencies(use_case) {
-                return Err(ScriptResponse::error(&error));
-            }
-        }
+            Some(
+                proxy_network::probe_dependencies(use_case)
+                    .map_err(|error| ScriptResponse::error(&error))?,
+            )
+        } else {
+            None
+        };
 
-        Ok(egress_plan)
+        Ok(ValidatedLaunch {
+            egress_plan,
+            bwrap: bwrap.path,
+            network_tools,
+        })
     }
 }
 
@@ -436,10 +445,23 @@ impl BubblewrapScriptRunner {
         &self,
         request: &ExecutionRequest,
         denied_files: &HashSet<String>,
-        egress_plan: Option<network_rules::EgressPlan>,
+        launch: ValidatedLaunch,
         logger: &mut Logger,
         stdio: StdioMode,
     ) -> Result<BwrapChild, ScriptResponse> {
+        let ValidatedLaunch {
+            egress_plan,
+            bwrap,
+            network_tools,
+        } = launch;
+        let checked_network_tools = || {
+            network_tools.as_ref().ok_or_else(|| {
+                ScriptResponse::error(
+                    "Bubblewrap: private networking was selected without checking its host tools.",
+                )
+            })
+        };
+
         // The caller manages the proxy; pass its address into the sandbox
         // environment and restrict direct egress to that endpoint.
         let configured_proxy = request.policy.network_proxy.address.as_ref();
@@ -487,6 +509,7 @@ impl BubblewrapScriptRunner {
                 // through the proxy rather than a nameserver of its own.
                 let resolver = None;
                 match proxy_network::ProxyNetworkNamespace::start(
+                    checked_network_tools()?,
                     &egress.plan(),
                     &network_rules::IngressPlan::for_policy(&request.policy),
                     egress.pin(),
@@ -514,6 +537,7 @@ impl BubblewrapScriptRunner {
                 let resolver =
                     proxy_network::ResolverPin::for_host(&request.policy, &mounts, logger);
                 match proxy_network::ProxyNetworkNamespace::start(
+                    checked_network_tools()?,
                     &plan,
                     &network_rules::IngressPlan::for_policy(&request.policy),
                     None,
@@ -568,7 +592,7 @@ impl BubblewrapScriptRunner {
         );
 
         // 3. Spawn `bwrap`.
-        let mut command = Command::new("bwrap");
+        let mut command = Command::new(&bwrap);
         command.args(&args);
         let pty = match stdio {
             StdioMode::Pipes => {
@@ -2153,7 +2177,10 @@ mod tests {
                 detail: "permission denied".to_string(),
             },
             bwrap_version::BwrapUnavailable::UnrecognizedVersion("junk".to_string()),
-            bwrap_version::BwrapUnavailable::TooOld(bwrap_version::BwrapVersion::new(0, 4, 1)),
+            bwrap_version::BwrapUnavailable::TooOld {
+                found: bwrap_version::BwrapVersion::new(0, 4, 1),
+                path: "/usr/bin/bwrap".into(),
+            },
         ];
 
         for failure in failures {
