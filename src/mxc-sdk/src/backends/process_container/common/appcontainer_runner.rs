@@ -39,8 +39,8 @@ use crate::mxc_common::audit::{
 use crate::mxc_common::error::WxcError;
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{
-    ContainerPolicy, ContainmentBackend, ExecutionRequest, FailurePhase, ProxyAddress,
-    SandboxOutputMetadata, ScriptResponse,
+    ContainerPolicy, ContainmentBackend, ExecutionRequest, FailurePhase, LearningModeCapability,
+    ProxyAddress, SandboxOutputMetadata, ScriptResponse,
 };
 use crate::mxc_common::process_util::{
     create_std_pipes, InterruptiblePipeReader, OwnedHandle, PipeReadCanceller, PipeWriter,
@@ -502,17 +502,6 @@ impl FilesystemMode {
     }
 }
 
-/// Config capability string that enables **learning mode**: the OS logs every
-/// *failed* access check for the AppContainer, but the access is still
-/// **denied** (deny-and-record). Containment is unchanged.
-pub(crate) const CAP_LEARNING_MODE_LOGGING: &str = "learningModeLogging";
-
-/// Config capability string that enables **permissive learning mode**: the OS
-/// logs every access check and **allows** it (audit / allow-all). This relaxes
-/// deny-by-default for the run, so it is security-sensitive; the runner emits a
-/// security warning whenever it is present.
-pub(crate) const CAP_PERMISSIVE_LEARNING_MODE: &str = "permissiveLearningMode";
-
 const LEARNING_MODE_INFORMATION: &str =
     "learningModeLogging is ENABLED: failed access attempts are logged; accesses are still denied \
      (deny-and-record).";
@@ -522,38 +511,6 @@ const PERMISSIVE_LEARNING_MODE_WARNING: &str =
 const PERMISSIVE_OVERRIDES_LEARNING_WARNING: &str =
     "*** SECURITY WARNING *** permissiveLearningMode overrides learningModeLogging: every access \
      check is logged AND ALLOWED (audit mode); the container is not enforcing deny-by-default.";
-
-/// A recognized Windows learning-mode capability.
-///
-/// The two learning-mode capabilities are semantically **distinct** and must
-/// not be conflated: [`Learning`](Self::Learning) only records denials (accesses
-/// stay denied), while [`Permissive`](Self::Permissive) additionally *allows*
-/// the accesses it logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LearningModeCapability {
-    /// `learningModeLogging` — log *failed* accesses; accesses remain **denied**
-    /// (deny-and-record). Containment is unchanged.
-    Learning,
-    /// `permissiveLearningMode` — log every access check and **allow** it
-    /// (audit / allow-all). Does not enforce deny-by-default.
-    Permissive,
-}
-
-impl LearningModeCapability {
-    /// Classify a policy capability string as a learning-mode capability, or
-    /// `None` if it is an unrelated capability. Matching is case-insensitive
-    /// because Windows derives the capability SID case-insensitively, so a
-    /// mis-cased spelling still takes effect and must be classified the same.
-    pub(crate) fn from_capability_name(name: &str) -> Option<Self> {
-        if name.eq_ignore_ascii_case(CAP_LEARNING_MODE_LOGGING) {
-            Some(Self::Learning)
-        } else if name.eq_ignore_ascii_case(CAP_PERMISSIVE_LEARNING_MODE) {
-            Some(Self::Permissive)
-        } else {
-            None
-        }
-    }
-}
 
 enum LearningModeDiagnostic {
     Information(&'static str),

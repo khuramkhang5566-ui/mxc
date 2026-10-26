@@ -11,7 +11,8 @@
 //! and [`super::correlation_vector::spin`]s a child off it; `deprovision`
 //! forgets the record on success. A record that cannot be found or read (never
 //! persisted, removed, corrupted, or the store is unavailable) degrades to a
-//! fresh, disconnected [`super::correlation_vector::seed`] — lineage is lost,
+//! fresh root that is retained for subsequent authorized phases. If the store
+//! is unavailable, it reports a diagnostic and uses a disconnected seed — lineage is lost,
 //! but a phase never derives a vector from `sandbox_id` itself, which — unlike
 //! a persisted root — is not guaranteed to carry 128 bits of entropy and, on
 //! some backends, can embed caller-supplied data.
@@ -36,9 +37,10 @@ const PRUNE_DELETE_LIMIT: usize = 256;
 /// Pre-dispatch correlation vector for a state-aware phase. `provision` always
 /// seeds a fresh vector (its `sandbox_id` doesn't exist yet — persist it via
 /// [`on_provision_outcome`] once dispatch mints one). Every other phase recalls
-/// the persisted lifecycle root for `sandbox_id` and spins a child off it, or
-/// seeds a fresh, disconnected vector if `sandbox_id` is absent or has no
-/// record. Returns an empty string when `active` is false, so an inactive
+/// the persisted lifecycle root for `sandbox_id` and spins a child off it,
+/// atomically creating a root if its record is missing or invalid. If storage
+/// is unavailable, correlation is disconnected. Returns an empty string when
+/// `active` is false, so an inactive
 /// telemetry provider pays for no RNG/clock/file-system work.
 pub fn pre_dispatch_vector(active: bool, is_provision: bool, sandbox_id: Option<&str>) -> String {
     if !active {
@@ -61,20 +63,17 @@ pub fn pre_dispatch_vector(active: bool, is_provision: bool, sandbox_id: Option<
 /// After a `provision` dispatch, persist `root` (this phase's already-computed
 /// vector, from [`pre_dispatch_vector`]) keyed by the freshly minted
 /// `sandbox_id` extracted from the success envelope, so later phases of this
-/// lifecycle can spin off it. A no-op when `active` is false, the dispatch
-/// failed, or the envelope did not carry `result.sandboxId` — later phases then
-/// simply find no record and seed their own disconnected vector.
+/// lifecycle can spin off it. An inactive successful provision removes stale
+/// state for a reused id, without creating a new record. Failed dispatches and
+/// envelopes without `result.sandboxId` leave existing state unchanged.
 pub fn on_provision_outcome(active: bool, root: &str, outcome: &Result<DispatchOutcome, MxcError>) {
-    if !active {
-        return;
-    }
     if let Ok(DispatchOutcome::Envelope(value)) = outcome {
         if let Some(sandbox_id) = value
             .get("result")
             .and_then(|result| result.get("sandboxId"))
             .and_then(|id| id.as_str())
         {
-            persist(sandbox_id, root);
+            on_typed_provision_result(active, root, Some(sandbox_id));
         }
     }
 }
@@ -82,9 +81,11 @@ pub fn on_provision_outcome(active: bool, root: &str, outcome: &Result<DispatchO
 /// Persist a typed provision result without requiring a JSON response envelope.
 #[doc(hidden)]
 pub fn on_typed_provision_result(active: bool, root: &str, sandbox_id: Option<&str>) {
-    if active {
-        if let Some(sandbox_id) = sandbox_id {
+    if let Some(sandbox_id) = sandbox_id {
+        if active {
             persist(sandbox_id, root);
+        } else {
+            with_store(|store| store.forget(sandbox_id));
         }
     }
 }
@@ -128,13 +129,26 @@ fn should_forget_after_deprovision<T>(outcome: &Result<T, MxcError>) -> bool {
     }
 }
 
-/// Recall the persisted lifecycle root for `sandbox_id` and spin a child off
-/// it. Seeds a fresh, disconnected vector if no valid record exists.
+/// Recall or atomically establish the lifecycle root, then spin a child.
 fn phase_vector(sandbox_id: &str) -> String {
     match with_store(|store| store.load_and_prune(sandbox_id)) {
         Some(root) if is_relayable(&root) => spin(&root),
-        _ => seed(),
+        _ => {
+            report_store_failure();
+            seed()
+        }
     }
+}
+
+fn report_store_failure() {
+    use std::io::Write;
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "telemetry: lifecycle correlation state unavailable or invalid; session continuity is not guaranteed"
+        );
+    });
 }
 
 fn persist(sandbox_id: &str, root: &str) {
@@ -179,12 +193,10 @@ fn with_store<R>(f: impl FnOnce(&dyn CorrelationStore) -> R) -> R {
 
 pub(crate) trait CorrelationStore: Send + Sync {
     fn persist(&self, sandbox_id: &str, root: &str);
+    #[cfg(test)]
     fn load(&self, sandbox_id: &str) -> Option<String>;
-    fn load_and_prune(&self, sandbox_id: &str) -> Option<String> {
-        let root = self.load(sandbox_id);
-        self.prune_stale(Some(sandbox_id));
-        root
-    }
+    /// Load or create under the same operation lock, protecting the active record.
+    fn load_and_prune(&self, sandbox_id: &str) -> Option<String>;
     fn forget(&self, sandbox_id: &str);
     fn prune_stale(&self, protected_sandbox_id: Option<&str>);
 }
@@ -297,31 +309,36 @@ impl FilesystemCorrelationStore {
                 Self::refresh_record(&path);
                 return Some(root);
             }
+            report_store_failure();
             let _ = fs::remove_file(&path);
+        } else if !matches!(path.try_exists(), Ok(false)) {
+            report_store_failure();
         }
         None
     }
 
-    fn write_record(&self, sandbox_id: &str, path: &Path, root: &str) {
+    fn write_record(&self, sandbox_id: &str, path: &Path, root: &str) -> bool {
         let Some(dir) = path.parent() else {
-            return;
+            return false;
         };
         if fs::create_dir_all(dir).is_err() {
-            return;
+            return false;
         }
 
         let Some(tmp) = self.tmp_path(sandbox_id) else {
-            return;
+            return false;
         };
         if fs::write(&tmp, root).is_err() {
-            return;
+            return false;
         }
         if fs::rename(&tmp, path).is_err() {
             let _ = fs::remove_file(path);
             if fs::rename(&tmp, path).is_err() {
                 let _ = fs::remove_file(&tmp);
+                return false;
             }
         }
+        true
     }
 
     fn tmp_file(path: &Path) -> bool {
@@ -389,14 +406,19 @@ impl FilesystemCorrelationStore {
 impl CorrelationStore for FilesystemCorrelationStore {
     fn persist(&self, sandbox_id: &str, root: &str) {
         let Some(_lock) = self.operation_lock() else {
+            report_store_failure();
             return;
         };
         let Some(path) = self.record_path(sandbox_id) else {
+            report_store_failure();
             return;
         };
-        self.write_record(sandbox_id, &path, root);
+        if !self.write_record(sandbox_id, &path, root) {
+            report_store_failure();
+        }
     }
 
+    #[cfg(test)]
     fn load(&self, sandbox_id: &str) -> Option<String> {
         let _lock = self.operation_lock()?;
         self.load_unlocked(sandbox_id)
@@ -404,17 +426,41 @@ impl CorrelationStore for FilesystemCorrelationStore {
 
     fn load_and_prune(&self, sandbox_id: &str) -> Option<String> {
         let _lock = self.operation_lock()?;
-        let root = self.load_unlocked(sandbox_id);
+        let root = match self.load_unlocked(sandbox_id) {
+            Some(root) => root,
+            None => {
+                let root = seed();
+                let path = self.record_path(sandbox_id)?;
+                if !self.write_record(sandbox_id, &path, &root) {
+                    return None;
+                }
+                root
+            }
+        };
         self.prune_stale_unlocked(Some(sandbox_id));
-        root
+        Some(root)
     }
 
     fn forget(&self, sandbox_id: &str) {
-        let Some(_lock) = self.operation_lock() else {
+        let Some(path) = self.record_path(sandbox_id) else {
             return;
         };
-        if let Some(path) = self.record_path(sandbox_id) {
-            let _ = fs::remove_file(path);
+        match path.try_exists() {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(_) => {
+                report_store_failure();
+                return;
+            }
+        }
+        let Some(_lock) = self.operation_lock() else {
+            report_store_failure();
+            return;
+        };
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                report_store_failure();
+            }
         }
     }
 
@@ -521,6 +567,18 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(sandbox_id)
                 .cloned()
+        }
+
+        fn load_and_prune(&self, sandbox_id: &str) -> Option<String> {
+            let root = self
+                .records
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .entry(sandbox_id.to_owned())
+                .or_insert_with(seed)
+                .clone();
+            self.prune_stale(Some(sandbox_id));
+            Some(root)
         }
 
         fn forget(&self, sandbox_id: &str) {
@@ -677,13 +735,13 @@ mod tests {
             &Ok(DispatchOutcome::Envelope(json!({}))),
         );
 
-        // Nothing to recall for any id: every subsequent phase seeds fresh.
+        // The first later authorized phase establishes a new lifecycle root.
         let a = pre_dispatch_vector(true, false, Some("wsb:abcdef01"));
         let b = pre_dispatch_vector(true, false, Some("wsb:abcdef01"));
-        assert_ne!(
+        assert_eq!(
             a.split('.').next().unwrap(),
             b.split('.').next().unwrap(),
-            "with nothing persisted, repeated calls must not coincidentally share a base"
+            "late-enabled phases must retain the same newly established root"
         );
     }
 
@@ -701,7 +759,11 @@ mod tests {
 
         let a = pre_dispatch_vector(true, false, Some("wsb:abcdef01"));
         let b = pre_dispatch_vector(true, false, Some("wsb:abcdef01"));
-        assert_ne!(a.split('.').next().unwrap(), b.split('.').next().unwrap());
+        assert_eq!(a.split('.').next().unwrap(), b.split('.').next().unwrap());
+        assert_ne!(
+            a.split('.').next().unwrap(),
+            provisioned.split('.').next().unwrap()
+        );
     }
 
     #[test]
@@ -967,5 +1029,97 @@ mod tests {
             !tmp_path.exists(),
             "stale temp files should still be reaped"
         );
+    }
+
+    #[test]
+    fn concurrent_late_enabled_phases_establish_one_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = tmp.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    FilesystemCorrelationStore::from_store_root(dir)
+                        .load_and_prune("synthetic-container")
+                        .expect("root persisted")
+                })
+            })
+            .collect();
+        let roots: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(roots.iter().all(|root| root == &roots[0]));
+    }
+
+    #[test]
+    fn inactive_provision_clears_stale_state_for_a_reused_container_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = StoreDirGuard::set(tmp.path());
+        let old = pre_dispatch_vector(true, true, None);
+        on_typed_provision_result(true, &old, Some("synthetic-container"));
+        on_typed_provision_result(false, "", Some("synthetic-container"));
+        let store = FilesystemCorrelationStore::from_store_root(tmp.path().to_path_buf());
+        assert_eq!(store.load("synthetic-container"), None);
+        let next = pre_dispatch_vector(true, false, Some("synthetic-container"));
+        assert_ne!(
+            super::super::session::from_vector(&old),
+            super::super::session::from_vector(&next)
+        );
+    }
+
+    #[test]
+    fn child_process_lifecycle_session_probe() {
+        let Some(dir) = std::env::var_os("MXC_TEST_LIFECYCLE_SESSION_STORE") else {
+            return;
+        };
+        let _guard = StoreDirGuard::set(Path::new(&dir));
+        let vector = pre_dispatch_vector(true, false, Some("synthetic-container"));
+        let mut logger =
+            crate::mxc_common::logger::Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        let _session = super::super::session::start(true, &vector, &mut logger);
+        let id = super::super::session::current().expect("valid session");
+        fs::write(
+            std::env::var_os("MXC_TEST_LIFECYCLE_SESSION_OUTPUT").unwrap(),
+            id.to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lifecycle_session_survives_separate_executor_processes_and_rotates_after_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = StoreDirGuard::set(tmp.path());
+        let root = pre_dispatch_vector(true, true, None);
+        on_typed_provision_result(true, &root, Some("synthetic-container"));
+        let expected = super::super::session::from_vector(&root)
+            .unwrap()
+            .to_string();
+        let output = tmp.path().join("synthetic-session-result.txt");
+        let child_session = || {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "core_modules::mxc_common::telemetry::correlation_state::tests::child_process_lifecycle_session_probe",
+                    "--test-threads=1",
+                ])
+                .env("MXC_TEST_LIFECYCLE_SESSION_STORE", tmp.path())
+                .env("MXC_TEST_LIFECYCLE_SESSION_OUTPUT", &output)
+                .output()
+                .unwrap();
+            assert!(child.status.success(), "{child:?}");
+            fs::read_to_string(&output).unwrap()
+        };
+        for _phase in ["start", "exec", "exec", "stop", "deprovision"] {
+            assert_eq!(child_session(), expected);
+        }
+        on_typed_deprovision_result("synthetic-container", false, &Ok(()));
+        // Telemetry first enabled after provision still establishes one stable
+        // new segment, shared by subsequent independent executor processes.
+        let next = child_session();
+        assert_ne!(next, expected);
+        assert_eq!(child_session(), next);
     }
 }

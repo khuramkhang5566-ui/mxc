@@ -17,7 +17,7 @@
 //!
 //! # Thread safety
 //!
-//! Provider state (version/channel strings) is stored in a `OnceLock` and is
+//! Provider state (version and channel) is stored in a `OnceLock` and is
 //! immutable after first initialisation. The `tracelogging` provider is
 //! internally synchronised.
 
@@ -27,6 +27,7 @@
 
 #[cfg(target_os = "windows")]
 mod provider {
+    use crate::mxc_common::telemetry::session;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use std::sync::OnceLock;
@@ -46,6 +47,15 @@ mod provider {
     struct ProviderState {
         version: String,
         channel: String,
+    }
+
+    impl ProviderState {
+        fn new(version: &str, channel: &str) -> Self {
+            Self {
+                version: version.to_owned(),
+                channel: channel.to_owned(),
+            }
+        }
     }
 
     static STATE: OnceLock<ProviderState> = OnceLock::new();
@@ -92,10 +102,7 @@ mod provider {
     /// Subsequent calls (even after [`shutdown`]) reuse the original values
     /// because the backing `OnceLock` cannot be reset.
     pub fn init(version: &str, channel: &str) -> bool {
-        STATE.get_or_init(|| ProviderState {
-            version: version.to_owned(),
-            channel: channel.to_owned(),
-        });
+        STATE.get_or_init(|| ProviderState::new(version, channel));
 
         let mut registered = REGISTERED.lock().unwrap_or_else(|e| e.into_inner());
         if *registered > 0 {
@@ -144,7 +151,57 @@ mod provider {
         }
     }
 
-    /// Emit an `MXC.Execution` ETW event.
+    /// Emit an `MXC.ExecutionStart` ETW event before dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_execution_start(
+        backend: &str,
+        sandbox_kind: &str,
+        exit_code: i32,
+        outcome: &str,
+        duration_ms: u64,
+        failure_reason: &str,
+        phase: &str,
+        correlation_vector: &str,
+    ) {
+        let state = match STATE.get() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
+        let is_debug_build = cfg!(debug_assertions);
+
+        tracelogging::write_event!(
+            MXC_PROVIDER,
+            "MXC.ExecutionStart",
+            level(Informational),
+            keyword(MXC_EVENT_KEYWORD),
+            u16("PartA_PrivacyProduct", &PRIVACY_PRODUCT_MXC),
+            u16(
+                "PartA_PrivacyDataCategory",
+                &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
+            ),
+            u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
+            str8("mxc.capture_denials", session::learning_mode().as_str()),
+            struct("COMMON_MXC_PARAMS", {
+                str8("Version", &state.version),
+                str8("Channel", &state.channel),
+                bool8("IsDebugging", &is_debug_build),
+                bool8("UTCReplace_AppSessionGuid", &true),
+            }),
+            str8("mxc.backend", backend),
+            str8("mxc.sandbox_kind", sandbox_kind),
+            i32("mxc.exit_code", &exit_code),
+            str8("mxc.outcome", outcome),
+            u64("mxc.duration_ms", &duration_ms),
+            str8("mxc.failure_reason", failure_reason),
+            str8("mxc.phase", phase),
+            str8("__TlgCV__", correlation_vector),
+        );
+    }
+
+    /// Emit an `MXC.ExecutionEnd` ETW event.
     ///
     /// `phase` is the state-aware lifecycle phase that produced this event —
     /// one of `provision|start|exec|stop|deprovision`. It is empty for one-shot
@@ -159,7 +216,7 @@ mod provider {
     /// identity — privacy-safe by construction. Empty for one-shot executions
     /// (which are a single process already correlated by `AppSessionGuid`).
     #[allow(clippy::too_many_arguments)]
-    pub fn log_execution(
+    pub fn log_execution_end(
         backend: &str,
         sandbox_kind: &str,
         exit_code: i32,
@@ -173,6 +230,8 @@ mod provider {
             Some(s) => s,
             None => return,
         };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
 
         // Compile-time flag — true for debug builds, false for release.
         // This is NOT a runtime IsDebuggerPresent() check; it mirrors
@@ -181,7 +240,7 @@ mod provider {
 
         tracelogging::write_event!(
             MXC_PROVIDER,
-            "MXC.Execution",
+            "MXC.ExecutionEnd",
             // Informational: every completion (success or failure) is a routine
             // "what happened" record, not a fault. Severity is reserved for
             // MXC.Error (Warning) and any future provider malfunction.
@@ -193,6 +252,8 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
+            str8("mxc.capture_denials", session::learning_mode().as_str()),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", &state.version),
                 str8("Channel", &state.channel),
@@ -228,7 +289,7 @@ mod provider {
     /// (`provision|start|exec|stop|deprovision`); empty for one-shot executions.
     ///
     /// `correlation_vector` is the Microsoft Correlation Vector (MS-CV), emitted
-    /// under `__TlgCV__` (see [`log_execution`]); empty for one-shot executions.
+    /// under `__TlgCV__` (see [`log_execution_end`]); empty for one-shot executions.
     pub fn log_error(
         backend: &str,
         sandbox_kind: &str,
@@ -241,6 +302,8 @@ mod provider {
             Some(s) => s,
             None => return,
         };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
 
         let is_debug_build = cfg!(debug_assertions);
 
@@ -261,6 +324,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", &state.version),
                 str8("Channel", &state.channel),
@@ -274,7 +338,7 @@ mod provider {
             // State-aware lifecycle phase (provision|start|exec|stop|
             // deprovision); empty for one-shot executions.
             str8("mxc.phase", phase),
-            // MS-CV under `__TlgCV__` (see MXC.Execution); empty for one-shot.
+            // MS-CV under `__TlgCV__` (see MXC.ExecutionEnd); empty for one-shot.
             str8("__TlgCV__", correlation_vector),
         );
     }
@@ -300,6 +364,8 @@ mod provider {
             Some(s) => s,
             None => return 0,
         };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
 
         let is_debug_build = cfg!(debug_assertions);
 
@@ -314,6 +380,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", &state.version),
                 str8("Channel", &state.channel),
@@ -341,6 +408,8 @@ mod provider {
 
     pub fn log_process_exited(identity: &str, process_id: u32, exit_code: i32) {
         let Some(state) = STATE.get() else { return };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
         let (version, channel, debugging, app_session) = common_params(state);
         tracelogging::write_event!(
             MXC_PROVIDER,
@@ -353,6 +422,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", version),
                 str8("Channel", channel),
@@ -367,6 +437,8 @@ mod provider {
 
     pub fn log_process_timed_out(identity: &str, process_id: u32, timeout_ms: u64) {
         let Some(state) = STATE.get() else { return };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
         let (version, channel, debugging, app_session) = common_params(state);
         tracelogging::write_event!(
             MXC_PROVIDER,
@@ -379,6 +451,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", version),
                 str8("Channel", channel),
@@ -398,6 +471,8 @@ mod provider {
         error_code: i32,
     ) {
         let Some(state) = STATE.get() else { return };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
         let (version, channel, debugging, app_session) = common_params(state);
         tracelogging::write_event!(
             MXC_PROVIDER,
@@ -410,6 +485,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", version),
                 str8("Channel", channel),
@@ -431,6 +507,8 @@ mod provider {
         effective_enforcement_level: &str,
     ) {
         let Some(state) = STATE.get() else { return };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
         let (version, channel, debugging, app_session) = common_params(state);
         tracelogging::write_event!(
             MXC_PROVIDER,
@@ -443,6 +521,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", version),
                 str8("Channel", channel),
@@ -459,6 +538,8 @@ mod provider {
 
     pub fn log_policy_hash(identity: &str, policy_hash: &str, config_schema_version: &str) {
         let Some(state) = STATE.get() else { return };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
         let (version, channel, debugging, app_session) = common_params(state);
         tracelogging::write_event!(
             MXC_PROVIDER,
@@ -471,6 +552,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", version),
                 str8("Channel", channel),
@@ -490,6 +572,8 @@ mod provider {
         proxy_port: u64,
     ) {
         let Some(state) = STATE.get() else { return };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
         let (version, channel, debugging, app_session) = common_params(state);
         tracelogging::write_event!(
             MXC_PROVIDER,
@@ -502,6 +586,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", version),
                 str8("Channel", channel),
@@ -517,6 +602,8 @@ mod provider {
 
     pub fn log_sandbox_torn_down(identity: &str, status: &str, released_resources: &str) {
         let Some(state) = STATE.get() else { return };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
         let (version, channel, debugging, app_session) = common_params(state);
         tracelogging::write_event!(
             MXC_PROVIDER,
@@ -529,6 +616,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", version),
                 str8("Channel", channel),
@@ -549,6 +637,8 @@ mod provider {
         phase: &str,
     ) {
         let Some(state) = STATE.get() else { return };
+        let mut session_buffer = [0; 36];
+        let session_id = session::wire_id(&mut session_buffer);
         let (version, channel, debugging, app_session) = common_params(state);
         tracelogging::write_event!(
             MXC_PROVIDER,
@@ -561,6 +651,7 @@ mod provider {
                 &PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA,
             ),
             u64("PartA_PrivTags", &MXC_PRIVACY_TAG),
+            str8("mxc.session_id", session_id),
             struct("COMMON_MXC_PARAMS", {
                 str8("Version", version),
                 str8("Channel", channel),
@@ -596,7 +687,20 @@ mod provider {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn log_execution(
+    pub fn log_execution_start(
+        _backend: &str,
+        _sandbox_kind: &str,
+        _exit_code: i32,
+        _outcome: &str,
+        _duration_ms: u64,
+        _failure_reason: &str,
+        _phase: &str,
+        _correlation_vector: &str,
+    ) {
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_execution_end(
         _backend: &str,
         _sandbox_kind: &str,
         _exit_code: i32,
@@ -679,11 +783,7 @@ pub use provider::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// The provider uses global state (`OnceLock`), so tests that call
-    /// `init`/`shutdown` must not run concurrently.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::mxc_common::telemetry::events::test_sink::TEST_LOCK;
 
     #[test]
     fn event_names_preserve_collector_contract() {
@@ -693,9 +793,14 @@ mod tests {
             .next()
             .expect("provider source precedes tests");
         assert!(
-            provider_source.contains("\"MXC.Execution\","),
-            "execution event identity changed"
+            provider_source.contains("\"MXC.ExecutionStart\","),
+            "execution start event is missing"
         );
+        assert!(
+            provider_source.contains("\"MXC.ExecutionEnd\","),
+            "execution end event is missing"
+        );
+        assert!(!provider_source.contains("\"MXC.Execution\","));
         assert!(
             provider_source.contains("\"MXC.Error\","),
             "error event identity changed"
@@ -733,30 +838,51 @@ mod tests {
             provider_source
                 .matches("u16(\"PartA_PrivacyProduct\", &PRIVACY_PRODUCT_MXC)")
                 .count(),
-            11,
+            12,
             "every MXC event must carry privacy product 11"
         );
         assert_eq!(
             provider_source
                 .matches("\"PartA_PrivacyDataCategory\"")
                 .count(),
-            11,
+            12,
             "every MXC event must carry a privacy data category"
         );
         assert_eq!(
             provider_source
                 .matches("&PRIVACY_DATA_CATEGORY_CLIENT_DIAGNOSTIC_DATA")
                 .count(),
-            11,
+            12,
             "every MXC event must use Client Diagnostic Data category 1"
         );
         assert_eq!(
             provider_source
                 .matches("u64(\"PartA_PrivTags\", &MXC_PRIVACY_TAG)")
                 .count(),
-            11,
+            12,
             "every MXC event must retain its approved privacy tag"
         );
+    }
+
+    #[test]
+    fn every_event_records_the_invocation_session_without_host_app() {
+        let source = include_str!("mod.rs");
+        let provider_source = source.split("// Tests").next().expect("provider source");
+        assert!(!provider_source.contains("host_app"));
+        let events: Vec<_> = provider_source
+            .split("tracelogging::write_event!(")
+            .skip(1)
+            .collect();
+        assert_eq!(events.len(), 12);
+        for event in events {
+            assert_eq!(
+                event
+                    .matches("str8(\"mxc.session_id\", session_id)")
+                    .count(),
+                1,
+                "each event must record the invocation session exactly once"
+            );
+        }
     }
 
     #[test]
@@ -808,10 +934,46 @@ mod tests {
     }
 
     #[test]
+    fn execution_start_and_end_have_identical_schemas() {
+        let source = include_str!("mod.rs").split("// Tests").next().unwrap();
+        assert_eq!(
+            source
+                .matches("str8(\"mxc.capture_denials\", session::learning_mode().as_str())")
+                .count(),
+            2,
+            "only the execution pair must include the selected learning mode"
+        );
+        let payload = |name: &str| {
+            source
+                .split_once(&format!("\"{name}\","))
+                .unwrap()
+                .1
+                .split_once("\n        );")
+                .unwrap()
+                .0
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(payload("MXC.ExecutionStart"), payload("MXC.ExecutionEnd"));
+    }
+
+    #[test]
     fn log_execution_after_init() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = init("0.0.0-test", "dev");
-        log_execution(
+        log_execution_start(
+            "test_backend",
+            "test_backend",
+            0,
+            "started",
+            0,
+            "",
+            "provision",
+            "iso:wxc-abcd",
+        );
+        log_execution_end(
             "test_backend",
             "test_backend",
             0,
@@ -863,7 +1025,8 @@ mod tests {
     #[test]
     fn log_without_init() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        log_execution(
+        log_execution_start("test_backend", "test_backend", 0, "started", 0, "", "", "");
+        log_execution_end(
             "test_backend",
             "test_backend",
             0,
@@ -882,7 +1045,8 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = init("0.0.0-test", "dev");
         shutdown();
-        log_execution(
+        log_execution_start("test_backend", "test_backend", 0, "started", 0, "", "", "");
+        log_execution_end(
             "test_backend",
             "test_backend",
             1,
@@ -906,7 +1070,8 @@ mod tests {
     fn handles_empty_strings() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = init("", "");
-        log_execution("", "", 0, "", 0, "", "", "");
+        log_execution_start("", "", 0, "started", 0, "", "", "");
+        log_execution_end("", "", 0, "", 0, "", "", "");
         log_error("", "", "", 0, "", "");
         log_verbose("", "", "", "", "", 0, 0, 0, 0, "", "[]", "{}");
         shutdown();
@@ -921,7 +1086,7 @@ mod tests {
                     scope.spawn(|| {
                         let active = init("0.0.0-concurrent-test", "dev");
                         if active {
-                            log_execution(
+                            log_execution_end(
                                 "test_backend",
                                 "test_backend",
                                 0,

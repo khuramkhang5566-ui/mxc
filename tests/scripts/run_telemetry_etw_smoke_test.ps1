@@ -35,7 +35,7 @@ if ($wxcExe -match '\\release\\') {
 $expectedBody = @'
 Help improve MXC and other Microsoft product including Windows by sharing optional diagnostic data with Microsoft.
 
-If enabled, MXC sends diagnostic information about product usage, performance, and reliability. MXC does not send your commands, file paths, credentials, or other customer content.
+If enabled, MXC sends diagnostic information about product usage, performance, and reliability, including a random session ID that links events from the same container lifecycle. MXC does not send your commands, full file paths, credentials, or other customer content.
 '@ -replace "`r`n", "`n"
 
 $configFile = Join-Path $repoRoot 'tests\examples\28_telemetry_enabled.json'
@@ -92,7 +92,7 @@ function Invoke-CanonicalGrant {
     if ($presentation.result -ne 'presentationRequired' -or -not $presentation.challenge -or -not $presentation.prompt) {
         throw "Unexpected consent presentation: $presentationLine"
     }
-    if ($presentation.prompt.resourceVersion -ne 3 -or
+    if ($presentation.prompt.resourceVersion -ne 4 -or
         $presentation.prompt.locale -ne 'en-US' -or
         $presentation.prompt.title.text -ne 'Help improve Microsoft Products' -or
         $presentation.prompt.body.text -ne $expectedBody -or
@@ -163,7 +163,7 @@ try {
             consent = $seed
             source = 'etw-smoke-proof'
             promptedMxcVersion = '0.0.0-smoke'
-            promptResourceVersion = 3
+            promptResourceVersion = 4
             promptLocale = 'en-US'
             updatedAtEpoch = 0
         }
@@ -218,28 +218,76 @@ try {
     if ($xml -notmatch [regex]::Escape($providerGuid)) {
         throw "The ETL contains events, but none identify the Microsoft.MXC provider ($providerGuid)."
     }
-    if ($xml -notmatch 'MXC\.Execution|MXC\.Error') {
-        throw 'Captured events did not preserve the MXC.Execution/MXC.Error identities.'
+    if ($xml -match '<Task>MXC\.Execution</Task>') {
+        throw 'The retired MXC.Execution event must not be emitted.'
     }
     $expectedFields = @(
         'PartA_PrivacyProduct',
         'PartA_PrivacyDataCategory',
         'PartA_PrivTags',
+        'mxc.session_id',
+        'mxc.capture_denials',
         'mxc.sandbox_kind',
         'mxc.backend',
         'mxc.exit_code',
         'mxc.outcome',
-        'mxc.duration_ms'
+        'mxc.duration_ms',
+        'mxc.failure_reason',
+        'mxc.phase',
+        '__TlgCV__'
     )
     $eventBlocks = [regex]::Matches($xml, '(?s)<Event\b.*?</Event>')
-    $matchingEvent = $eventBlocks | Where-Object {
-        $eventXml = $_.Value
-        -not ($expectedFields | Where-Object {
-            $eventXml -notmatch [regex]::Escape($_)
-        })
-    } | Select-Object -First 1
-    if ($null -eq $matchingEvent) {
-        throw "No MXC event contained all required telemetry fields: $($expectedFields -join ', ')."
+    $starts = @($eventBlocks | Where-Object { $_.Value -match '<Task>MXC\.ExecutionStart</Task>' })
+    $ends = @($eventBlocks | Where-Object { $_.Value -match '<Task>MXC\.ExecutionEnd</Task>' })
+    if ($starts.Count -ne 1 -or $ends.Count -ne 1) {
+        throw "Expected one ExecutionStart/ExecutionEnd pair; found $($starts.Count) starts and $($ends.Count) ends."
+    }
+    [xml]$startEvent = $starts[0].Value
+    [xml]$endEvent = $ends[0].Value
+    $startFields = @{}
+    $endFields = @{}
+    foreach ($node in $startEvent.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']")) {
+        $startFields[$node.GetAttribute('Name')] = $node.InnerText
+    }
+    foreach ($node in $endEvent.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']")) {
+        $endFields[$node.GetAttribute('Name')] = $node.InnerText
+    }
+    foreach ($field in $expectedFields) {
+        if (-not $startFields.ContainsKey($field) -or -not $endFields.ContainsKey($field)) {
+            throw "The execution pair is missing required field '$field'."
+        }
+        if ($startFields.ContainsKey('mxc.host_app') -or $endFields.ContainsKey('mxc.host_app')) {
+            throw 'ExecutionStart and ExecutionEnd must not include host application attribution.'
+        }
+    }
+    if ($startFields['mxc.outcome'] -ne 'started' -or
+        $startFields['mxc.exit_code'] -ne '0' -or
+        $startFields['mxc.duration_ms'] -ne '0' -or
+        $startFields['mxc.failure_reason'] -ne '') {
+        throw 'ExecutionStart did not preserve the documented result placeholders.'
+    }
+    if ($endFields['mxc.outcome'] -notin @('success', 'failure')) {
+        throw 'ExecutionEnd did not report a terminal outcome.'
+    }
+    foreach ($mode in @($startFields['mxc.capture_denials'], $endFields['mxc.capture_denials'])) {
+        if ($mode -cnotin @('enforce', 'deny-and-record', 'allow-and-record', 'not_applicable')) {
+            throw 'ExecutionStart and ExecutionEnd must report a bounded denial-capture mode.'
+        }
+    }
+    foreach ($field in @('mxc.session_id', 'mxc.capture_denials', 'mxc.backend', 'mxc.sandbox_kind', 'mxc.phase', '__TlgCV__')) {
+        if ($startFields[$field] -ne $endFields[$field]) {
+            throw "ExecutionStart and ExecutionEnd have different '$field' attribution."
+        }
+    }
+    $sessionId = [guid]::Empty
+    if (-not [guid]::TryParse($startFields['mxc.session_id'], [ref]$sessionId) -or $sessionId -eq [guid]::Empty) {
+        throw 'The execution pair did not contain a valid random session ID.'
+    }
+    if ($startEvent.Event.System.Execution.ProcessID -ne "$($proc.Id)" -or
+        $endEvent.Event.System.Execution.ProcessID -ne "$($proc.Id)" -or
+        [DateTimeOffset]$startEvent.Event.System.TimeCreated.SystemTime -gt
+        [DateTimeOffset]$endEvent.Event.System.TimeCreated.SystemTime) {
+        throw 'The execution pair has an unexpected emitter or timestamp order.'
     }
     Write-Host 'PASSED: isolated MXC ETW capture smoke test' -ForegroundColor Green
 } finally {
