@@ -1,7 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+param(
+    [Parameter(Mandatory)][string]$WxcExePath
+)
+
 $ErrorActionPreference = 'Stop'
+$WxcExec = (Resolve-Path -LiteralPath $WxcExePath).Path
 . (Join-Path $PSScriptRoot 'lib\TelemetryEtwAssertions.ps1')
 
 $providerGuid = [guid]'11111111-2222-4333-8444-555555555555'
@@ -132,6 +137,91 @@ try {
         throw 'The explicit unsupported-version fixture was lost.'
     }
     Write-Host 'PASS: release consent fixture defaults and unsupported-version control'
+} finally {
+    Remove-Item -LiteralPath $scratch -Recurse -Force
+}
+
+# Validate the actual scenario's requests with --dry-run, without provisioning
+# accounts or sessions. Synthetic results let the same orchestration continue.
+$suitePath = Join-Path $PSScriptRoot 'run_isolation_session_state_aware_tests.ps1'
+$suiteSyntax = [Management.Automation.Language.Parser]::ParseFile($suitePath, [ref]$null, [ref]$parseErrors)
+if ($parseErrors) { throw ($parseErrors -join "`n") }
+foreach ($functionName in @('ConvertTo-StateAwareInvocation', 'Invoke-StateAware')) {
+    $definition = $suiteSyntax.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
+    }, $true)
+    if (-not $definition) { throw "Lifecycle helper '$functionName' was not found." }
+    $functionText = $definition.Extent.Text
+    if ($functionName -eq 'Invoke-StateAware') {
+        $functionText = $functionText.Replace('function Invoke-StateAware {', 'function Invoke-ValidatedStateAware {')
+    }
+    . ([scriptblock]::Create($functionText))
+}
+$scenario = $suiteSyntax.Find({
+    param($node)
+    $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -eq '$TelemetryResultsPath' -and
+        $node.Extent.Text.Contains('$telemetryInvocations =')
+}, $true)
+if (-not $scenario) { throw 'Lifecycle telemetry scenario was not found.' }
+$statements = $scenario.Clauses[0].Item2.Statements
+if ($statements[-1] -isnot [Management.Automation.Language.ExitStatementAst]) {
+    throw 'Expected the lifecycle scenario to end with its exit gate.'
+}
+$runScenario = [scriptblock]::Create(
+    ($statements[0..($statements.Count - 2)] | ForEach-Object { $_.Extent.Text }) -join "`n")
+$script:validatedRequests = [Collections.Generic.List[object]]::new()
+$syntheticPayload = '{"version":1,"agentUserName":"mxc-telemetry-dry-run"}'
+$syntheticSandboxId = 'iso:' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($syntheticPayload)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
+function Parse-Envelope {
+    param([string]$Stdout)
+    $Stdout | ConvertFrom-Json
+}
+
+function Invoke-StateAware {
+    param([hashtable]$Request)
+    $validationRequest = $Request.Clone()
+    $validationRequest.telemetry = @{ enabled = $false }
+    $validation = Invoke-ValidatedStateAware -Request $validationRequest -DryRun
+    if ($validation.ExitCode -ne 0) {
+        throw "Lifecycle '$($Request.phase)' failed real dry-run validation: $($validation.Stdout) $($validation.Stderr)"
+    }
+    $script:validatedRequests.Add($Request.Clone())
+    $stdout = switch ($Request.phase) {
+        'provision' { @{ result = @{ sandboxId = $syntheticSandboxId } } | ConvertTo-Json -Compress }
+        'exec' { 'mxc-telemetry-lifecycle' }
+        default { '{"result":{}}' }
+    }
+    @{ ProcessId = 100 + $script:validatedRequests.Count; ExitCode = 0; Stdout = $stdout; Stderr = '' }
+}
+
+$scratch = Join-Path ([IO.Path]::GetTempPath()) ("mxc-lifecycle-requests-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $scratch | Out-Null
+try {
+    $TelemetryResultsPath = Join-Path $scratch 'invocations.json'
+    & $runScenario
+    $manifest = @(Get-Content -LiteralPath $TelemetryResultsPath -Raw | ConvertFrom-Json)
+    if ($manifest.Count -ne 12 -or $script:validatedRequests.Count -ne 12) {
+        throw 'The lifecycle scenario did not validate all twelve executor requests.'
+    }
+    foreach ($request in $script:validatedRequests) {
+        if ($request.telemetry.enabled -ne $true -or
+            ($request.phase -ne 'provision' -and $request.ContainsKey('network'))) {
+            throw 'Lifecycle opt-in or provision-only network placement was lost.'
+        }
+    }
+    $missingNetwork = $script:validatedRequests[0].Clone()
+    $null = $missingNetwork.Remove('network')
+    $missingNetwork.telemetry = @{ enabled = $false }
+    $rejected = Invoke-ValidatedStateAware -Request $missingNetwork -DryRun
+    $rejectionText = "$($rejected.Stdout)`n$($rejected.Stderr)"
+    if ($rejected.ExitCode -eq 0 -or $rejectionText -notmatch 'malformed_request' -or
+        $rejectionText -notmatch 'missing field .network.') {
+        throw 'The missing-network counterfactual must be rejected by the real contract parser.'
+    }
+    Write-Host 'PASS: actual lifecycle requests pass real CLI/backend dry-run validation; missing-network control fails'
 } finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force
 }

@@ -488,6 +488,10 @@ if ($TelemetryResultsPath) {
                 }
                 if ($phase -eq 'provision') {
                     $request.containment = 'isolation_session'
+                    $request.network = @{
+                        egress = @{ default = 'allow' }
+                        ingress = @{ default = 'allow'; hostLoopback = 'allow' }
+                    }
                 } else {
                     $request.sandboxId = $telemetrySandboxId
                 }

@@ -259,7 +259,9 @@ ETL, decoded XML and the invocation manifest remain under the suite's redirected
 TEMP for the normal log upload. The HKCU test key and process overrides are
 restored even on failure. No telemetry uploader is started. The offline
 `tests/scripts/test_telemetry_etw_assertions.ps1` regression checks the trace
-oracle and release consent fixture defaults in each Windows build job.
+oracle, release consent fixture defaults, and the scenario's requests through
+real CLI/backend dry-run validation in each Windows build job. Its missing-network
+control confirms that provision cannot silently inherit a permissive policy.
 
 ### IsolationSession Rust test concurrency
 

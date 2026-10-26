@@ -42,10 +42,6 @@ jobs:
         shell: pwsh
         run: ..\tests\scripts\test_sdk_suite_results.ps1
 
-      - name: Test telemetry ETW assertions and consent fixtures
-        shell: pwsh
-        run: ..\tests\scripts\test_telemetry_etw_assertions.ps1
-
       # actions-rust-lang/setup-rust-toolchain auto-reads rust-toolchain.toml
       # from the repo root only. Surface src/rust-toolchain.toml there so the
       # 1.93 pin is honored without duplicating the version in this workflow.
@@ -99,6 +95,10 @@ jobs:
         env:
           MXC_TELEMETRY_PROVIDER_GROUP_GUID: ''
         run: cargo build --locked -p wxc --features "test-support isolation_session"
+
+      - name: Test telemetry ETW assertions, lifecycle requests and consent fixtures
+        shell: pwsh
+        run: ..\tests\scripts\test_telemetry_etw_assertions.ps1 -WxcExePath target\debug\wxc-exec.exe
 
       - name: Upload local-only telemetry test executor
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
