@@ -192,7 +192,7 @@ function Assert-Status {
 }
 
 function Write-ConsentRecord {
-    param([string]$Consent, [int]$PromptVersion = 3, [string]$Locale = 'en-US')
+    param([string]$Consent, [int]$PromptVersion = 4, [string]$Locale = 'en-US')
 
     $record = [pscustomobject]@{
         schemaVersion         = 2

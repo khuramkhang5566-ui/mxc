@@ -20,7 +20,10 @@ thread_local! {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SessionContext {
+    // Preserve transferable attribution even where telemetry emission is a no-op.
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     session_id: Option<Uuid>,
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     learning_mode: LearningMode,
     disabled: bool,
 }
@@ -119,6 +122,7 @@ pub(crate) fn capture() -> SessionContext {
     })
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn current() -> Option<Uuid> {
     capture().session_id
 }
@@ -127,6 +131,7 @@ pub(crate) fn invocation_disabled() -> bool {
     capture().disabled
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn learning_mode() -> LearningMode {
     capture().learning_mode
 }
@@ -138,6 +143,7 @@ pub(crate) fn resume(context: SessionContext) -> SessionScope {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn wire_id(buffer: &mut [u8; 36]) -> &str {
     match current() {
         Some(id) => id.hyphenated().encode_lower(buffer),

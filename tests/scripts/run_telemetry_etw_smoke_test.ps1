@@ -7,15 +7,24 @@
     redirects before any MXC write, grants consent through the canonical
     session-bound presenter protocol, captures the public MXC ETW provider,
     and restores all process/machine state in finally.
+
+.PARAMETER IsolationSessionLifecycle
+    Captures two real IsolationSession lifecycles through the existing lifecycle
+    suite instead of the create-and-run smoke request. Requires an available
+    IsolationSession backend and Administrator; missing prerequisites fail.
+    The executor must be a local-only debug build with test-support and
+    isolation_session features.
 #>
 
 [CmdletBinding()]
 param(
     [string]$BinDir,
-    [switch]$SkipClean
+    [switch]$SkipClean,
+    [switch]$IsolationSessionLifecycle
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib\TelemetryEtwAssertions.ps1')
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $srcDir = Join-Path $repoRoot 'src'
 if (-not $BinDir) {
@@ -125,6 +134,7 @@ function Invoke-CanonicalGrant {
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    if ($IsolationSessionLifecycle) { throw 'Administrator privileges are required for lifecycle ETW capture.' }
     Write-Host 'SKIPPED: Administrator privileges are required for ETW session creation.' -ForegroundColor Yellow
     exit 0
 }
@@ -191,104 +201,44 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Failed to create ETW trace session.' }
     $traceStarted = $true
 
-    $executionTimeoutSeconds = 60
-    $proc = Start-Process -FilePath $wxcExe -ArgumentList '--debug', $configFile -PassThru -NoNewWindow
-    # Caching the handle keeps ExitCode readable after the process exits.
-    $null = $proc.Handle
-    if (-not $proc.WaitForExit($executionTimeoutSeconds * 1000)) {
-        Stop-Process -Id $proc.Id -Force
-        $proc.WaitForExit()
-        throw "wxc-exec timed out after $executionTimeoutSeconds seconds"
+    if ($IsolationSessionLifecycle) {
+        $manifestFile = Join-Path $tempDir 'lifecycle-invocations.json'
+        $global:LASTEXITCODE = 0
+        & (Join-Path $PSScriptRoot 'run_isolation_session_state_aware_tests.ps1') `
+            -WxcExePath $wxcExe -TelemetryResultsPath $manifestFile
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $manifestFile)) {
+            throw 'IsolationSession lifecycle telemetry scenario did not complete.'
+        }
+        $invocations = @(Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json)
+        $remainingRecords = @(Get-ChildItem -LiteralPath (Join-Path $tempDir 'mxc\correlation') -Filter '*.cv' -ErrorAction Stop)
+        if ($remainingRecords.Count -ne 0) { throw 'Deprovision left lifecycle correlation records behind.' }
+    } else {
+        $executionTimeoutSeconds = 60
+        $proc = Start-Process -FilePath $wxcExe -ArgumentList '--debug', $configFile -PassThru -NoNewWindow
+        # Caching the handle keeps ExitCode readable after the process exits.
+        $null = $proc.Handle
+        if (-not $proc.WaitForExit($executionTimeoutSeconds * 1000)) {
+            Stop-Process -Id $proc.Id -Force
+            $proc.WaitForExit()
+            throw "wxc-exec timed out after $executionTimeoutSeconds seconds"
+        }
+        Write-Host "wxc-exec exited with code $($proc.ExitCode)"
+        $invocations = @([pscustomobject]@{ ProcessId = $proc.Id })
     }
-    Write-Host "wxc-exec exited with code $($proc.ExitCode)"
     Start-Sleep -Seconds 2
 
     logman stop $sessionName -ets 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to stop ETW trace session.' }
     $traceStarted = $false
     if (-not (Test-Path $etlFile) -or (Get-Item $etlFile).Length -eq 0) {
         throw 'ETL output was absent or empty.'
     }
     tracerpt "$etlFile" -o "$xmlFile" -of XML -lr -y 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to decode ETW trace.' }
     if (-not (Test-Path $xmlFile)) { throw 'tracerpt did not produce XML.' }
     $xml = Get-Content $xmlFile -Raw
-    $eventCount = ([regex]::Matches($xml, '<Event ')).Count
-    if ($eventCount -eq 0) {
-        throw 'No parseable MXC events were captured.'
-    }
-    if ($xml -notmatch [regex]::Escape($providerGuid)) {
-        throw "The ETL contains events, but none identify the Microsoft.MXC provider ($providerGuid)."
-    }
-    if ($xml -match '<Task>MXC\.Execution</Task>') {
-        throw 'The retired MXC.Execution event must not be emitted.'
-    }
-    $expectedFields = @(
-        'PartA_PrivacyProduct',
-        'PartA_PrivacyDataCategory',
-        'PartA_PrivTags',
-        'mxc.session_id',
-        'mxc.capture_denials',
-        'mxc.sandbox_kind',
-        'mxc.backend',
-        'mxc.exit_code',
-        'mxc.outcome',
-        'mxc.duration_ms',
-        'mxc.failure_reason',
-        'mxc.phase',
-        '__TlgCV__'
-    )
-    $eventBlocks = [regex]::Matches($xml, '(?s)<Event\b.*?</Event>')
-    $starts = @($eventBlocks | Where-Object { $_.Value -match '<Task>MXC\.ExecutionStart</Task>' })
-    $ends = @($eventBlocks | Where-Object { $_.Value -match '<Task>MXC\.ExecutionEnd</Task>' })
-    if ($starts.Count -ne 1 -or $ends.Count -ne 1) {
-        throw "Expected one ExecutionStart/ExecutionEnd pair; found $($starts.Count) starts and $($ends.Count) ends."
-    }
-    [xml]$startEvent = $starts[0].Value
-    [xml]$endEvent = $ends[0].Value
-    $startFields = @{}
-    $endFields = @{}
-    foreach ($node in $startEvent.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']")) {
-        $startFields[$node.GetAttribute('Name')] = $node.InnerText
-    }
-    foreach ($node in $endEvent.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']")) {
-        $endFields[$node.GetAttribute('Name')] = $node.InnerText
-    }
-    foreach ($field in $expectedFields) {
-        if (-not $startFields.ContainsKey($field) -or -not $endFields.ContainsKey($field)) {
-            throw "The execution pair is missing required field '$field'."
-        }
-        if ($startFields.ContainsKey('mxc.host_app') -or $endFields.ContainsKey('mxc.host_app')) {
-            throw 'ExecutionStart and ExecutionEnd must not include host application attribution.'
-        }
-    }
-    if ($startFields['mxc.outcome'] -ne 'started' -or
-        $startFields['mxc.exit_code'] -ne '0' -or
-        $startFields['mxc.duration_ms'] -ne '0' -or
-        $startFields['mxc.failure_reason'] -ne '') {
-        throw 'ExecutionStart did not preserve the documented result placeholders.'
-    }
-    if ($endFields['mxc.outcome'] -notin @('success', 'failure')) {
-        throw 'ExecutionEnd did not report a terminal outcome.'
-    }
-    foreach ($mode in @($startFields['mxc.capture_denials'], $endFields['mxc.capture_denials'])) {
-        if ($mode -cnotin @('enforce', 'deny-and-record', 'allow-and-record', 'not_applicable')) {
-            throw 'ExecutionStart and ExecutionEnd must report a bounded denial-capture mode.'
-        }
-    }
-    foreach ($field in @('mxc.session_id', 'mxc.capture_denials', 'mxc.backend', 'mxc.sandbox_kind', 'mxc.phase', '__TlgCV__')) {
-        if ($startFields[$field] -ne $endFields[$field]) {
-            throw "ExecutionStart and ExecutionEnd have different '$field' attribution."
-        }
-    }
-    $sessionId = [guid]::Empty
-    if (-not [guid]::TryParse($startFields['mxc.session_id'], [ref]$sessionId) -or $sessionId -eq [guid]::Empty) {
-        throw 'The execution pair did not contain a valid random session ID.'
-    }
-    if ($startEvent.Event.System.Execution.ProcessID -ne "$($proc.Id)" -or
-        $endEvent.Event.System.Execution.ProcessID -ne "$($proc.Id)" -or
-        [DateTimeOffset]$startEvent.Event.System.TimeCreated.SystemTime -gt
-        [DateTimeOffset]$endEvent.Event.System.TimeCreated.SystemTime) {
-        throw 'The execution pair has an unexpected emitter or timestamp order.'
-    }
+    Assert-TelemetryExecutionTrace -XmlText $xml -ProviderGuid $providerGuid `
+        -Invocations $invocations -RequireLifecycles:$IsolationSessionLifecycle
     Write-Host 'PASSED: isolated MXC ETW capture smoke test' -ForegroundColor Green
 } finally {
     if ($traceStarted) { logman stop $sessionName -ets 2>$null | Out-Null }

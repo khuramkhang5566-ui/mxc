@@ -18,6 +18,11 @@ the individual local test scripts are documented in
   `Build.MacOS.Job.yml`, and for ProcessContainer and IsolationSession the
   Windows SDK bundle from `Package.WindowsSdk.TestBundle.Job.yml`, in the same
   workflow run, so what gets tested is exactly what got built.
+
+- IsolationSession also downloads `telemetry-test-executor-<target>`, a separate
+  local-only debug executor with `test-support` and `isolation_session`. Shipping
+  release binaries never enable the consent/policy test overrides.
+
 - The matrix is **declarative**. `scripts/ci/validation-test-matrix.json` is the
   only file you edit to change *what runs where*;
   `scripts/ci/resolve-validation-test-matrix.mjs` validates it and expands a
@@ -65,7 +70,7 @@ test jobs only ever `download-artifact`.
 | Job | What it does |
 |-----|--------------|
 | `dependency-feed-check` | Resolves the locked crate graph through the public `MxcDependencies` feed. Gates the builds. |
-| `windows` | `Build.Windows.Job.yml` — x64 + arm64 release build, unit tests, uploads `wxc-binaries-<target>`. |
+| `windows` | `Build.Windows.Job.yml` — x64 + arm64 release build, unit tests, uploads `wxc-binaries-<target>` and the separate `telemetry-test-executor-<target>`. |
 | `linux` | `Build.Linux.Job.yml` — x64 + arm64 release build, unit tests including Bubblewrap seccomp and argument generation, Bubblewrap SDK streaming/PTY tests, `wxc_e2e_tests`, uploads `lxc-binaries-<target>`. |
 | `macos` | `Build.MacOS.Job.yml` — arm64 release build, unit tests, Seatbelt SDK streaming/PTY tests, `wxc_e2e_tests`, uploads `mxc-binaries-aarch64-apple-darwin`. |
 | `windows-sdk-bundle` | `Package.WindowsSdk.TestBundle.Job.yml` — uploads `windows-sdk-test-bundle-<target>` for x64 + arm64. |
@@ -213,7 +218,7 @@ get fixed or wired.
 | Bubblewrap | ✅ Good | The scheduled CLI suite checks controlling-terminal isolation with private PTY fixtures, including redirected stdio. The Linux build job also checks SDK pipes under a controlling terminal, cancellation without parent-death protection, and private-PTY input/output and resizing. These checks do not require enabling legacy TIOCSTI. |
 | LXC | ✅ Good | Some networking tests fail on distros other than Ubuntu 24.04; seems to be an issue with MXC. The in-process streaming handle is covered at PR time by `lxc-e2e.yml` instead, because this matrix runs prebuilt binaries. |
 | WSLC | ✅ Good | Might have to retry hung jobs - this is an issue with overzealous agent reclaiming. |
-| IsolationSession | ✅ Good | Runs the one-shot and state-aware suites, the Rust SDK in-process and helper tests, the C# end-to-end tests, the Node SDK suite and the COM apartment probe. Fails when the host cannot run isolation sessions, when a suite executes nothing, or when the run changes the set of local accounts. |
+| IsolationSession | ✅ Good | Runs the one-shot and state-aware suites, isolated lifecycle ETW capture, the Rust SDK in-process and helper tests, the C# end-to-end tests, the Node SDK suite and the COM apartment probe. Fails when the host cannot run isolation sessions, when a suite executes nothing, or when the run changes the set of local accounts. |
 | Windows Sandbox | ⛔ Blocked | Images don't support `Containers-DisposableClientVM` opt. feature |
 | MicroVM | ⛔ Not working | Windows cold and warm starts hang; no Linux suite. The artifact payload is currently commented out in the build jobs. |
 | Seatbelt | ✅ Good | Failures are genuine MXC bugs. |
@@ -231,6 +236,30 @@ Node public `run` and `spawn` integration cases. The .NET suite checks stdin,
 stdout, stderr, large output, cancellation, kill, and timeout behavior.
 Required test names and methods must pass; empty selections and skipped
 streaming cases fail the job even when the runner exits successfully.
+
+### IsolationSession lifecycle telemetry
+
+Every scheduled `isolation-session` job runs
+`run_telemetry_etw_smoke_test.ps1 -IsolationSessionLifecycle -SkipClean` against
+the architecture-matched telemetry test executor. That artifact is built with
+an empty `MXC_TELEMETRY_PROVIDER_GROUP_GUID`, so it has no UTC provider-group
+routing. Consent is granted only in a temporary test store and policy is
+redirected to an isolated HKCU key; real user consent and HKLM policy are not
+modified.
+
+The existing lifecycle suite runs provision, start, two successful execs, stop
+and deprovision twice, each phase in a separate executor process. The local
+ETW trace must contain one matching ExecutionStart/ExecutionEnd pair per
+recorded PID, correct phase/backend/mode attribution, one session ID and CV
+root throughout each lifecycle, and fresh attribution after cleanup. Successful
+deprovision must remove the isolated correlation records. Missing privileges,
+unsupported hosts, incomplete scenarios and missing events fail the job.
+
+ETL, decoded XML and the invocation manifest remain under the suite's redirected
+TEMP for the normal log upload. The HKCU test key and process overrides are
+restored even on failure. No telemetry uploader is started. The offline
+`tests/scripts/test_telemetry_etw_assertions.ps1` regression checks the trace
+oracle and release consent fixture defaults in each Windows build job.
 
 ### IsolationSession Rust test concurrency
 
