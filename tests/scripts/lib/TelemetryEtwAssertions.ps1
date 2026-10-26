@@ -30,7 +30,7 @@ function Assert-TelemetryExecutionTrace {
         foreach ($event in $trace.SelectNodes("//*[local-name()='Event']")) {
             if ([string]$event.System.Provider.Guid -ne "{$ProviderGuid}" -and
                 [string]$event.System.Provider.Guid -ne "$ProviderGuid") { continue }
-            $task = [string]$event.System.Task
+            $task = [string]$event.RenderingInfo.Task
             if ($task -eq 'MXC.Execution') { throw 'The retired MXC.Execution event was emitted.' }
             if ($task -notin @('MXC.ExecutionStart', 'MXC.ExecutionEnd')) { continue }
             $fields = @{}

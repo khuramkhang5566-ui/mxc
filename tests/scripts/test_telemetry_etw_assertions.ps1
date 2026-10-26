@@ -38,7 +38,7 @@ function New-TestTrace {
                 '__TlgCV__' = "lifecycle$($invocation.Lifecycle).$($invocation.ProcessId).0"
             }
             $eventData = foreach ($field in $fields.Keys) { "<Data Name='$field'>$($fields[$field])</Data>" }
-            "<Event><System><Provider Guid='{$providerGuid}'/><Task>$task</Task><Execution ProcessID='$($invocation.ProcessId)'/><TimeCreated SystemTime='2026-01-01T00:00:00Z'/></System><EventData>$($eventData -join '')</EventData></Event>"
+            "<Event><System><Provider Guid='{$providerGuid}'/><Task>0</Task><Execution ProcessID='$($invocation.ProcessId)'/><TimeCreated SystemTime='2026-01-01T00:00:00Z'/></System><EventData>$($eventData -join '')</EventData><RenderingInfo Culture='en-US'><Task>$task</Task></RenderingInfo></Event>"
         }
     }
     "<Events xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>$($eventXml -join '')</Events>"
@@ -57,6 +57,14 @@ $cases = @(
     @{ Name = 'duplicate start'; Mutate = { $null = $trace.DocumentElement.AppendChild($trace.DocumentElement.FirstChild.CloneNode($true)) }; Fails = $true },
     @{ Name = 'wrong emitter'; Mutate = { $trace.DocumentElement.LastChild.System.Execution.SetAttribute('ProcessID', '9999') }; Fails = $true },
     @{ Name = 'wrong provider'; Mutate = { $trace.DocumentElement.LastChild.System.Provider.SetAttribute('Guid', '{99999999-2222-4333-8444-555555555555}') }; Fails = $true },
+    @{ Name = 'missing rendered event name'; Mutate = {
+        $event = $trace.DocumentElement.FirstChild
+        $null = $event.RemoveChild($event.RenderingInfo)
+        $event.System.Task = 'MXC.ExecutionStart'
+    }; Fails = $true },
+    @{ Name = 'retired rendered event name'; Mutate = {
+        $trace.DocumentElement.FirstChild.RenderingInfo.Task = 'MXC.Execution'
+    }; Fails = $true },
     @{ Name = 'unknown session ID'; Mutate = { Set-TestField $trace 0 'mxc.session_id' 'unknown' }; Fails = $true },
     @{ Name = 'Start End ID mismatch'; Mutate = { Set-TestField $trace 1 'mxc.session_id' '00000000-0000-4000-8000-000000000009' }; Fails = $true },
     @{ Name = 'lost ID between processes'; Mutate = {
@@ -96,6 +104,12 @@ foreach ($case in $cases) {
 Assert-TelemetryExecutionTrace -XmlText (New-TestTrace) -ProviderGuid $providerGuid `
     -Invocations @($invocations[0])
 Write-Host 'PASS: basic smoke execution pair'
+[xml]$failedExecutionTrace = New-TestTrace
+Set-TestField $failedExecutionTrace 1 'mxc.outcome' 'failure'
+Set-TestField $failedExecutionTrace 1 'mxc.exit_code' '1'
+Assert-TelemetryExecutionTrace -XmlText $failedExecutionTrace.OuterXml -ProviderGuid $providerGuid `
+    -Invocations @($invocations[0])
+Write-Host 'PASS: basic smoke failure execution pair on an unavailable backend'
 foreach ($manifestCase in @(
     @{ Name = 'empty selection'; Invocations = @() },
     @{ Name = 'only one lifecycle'; Invocations = @($invocations | Select-Object -First 6) },

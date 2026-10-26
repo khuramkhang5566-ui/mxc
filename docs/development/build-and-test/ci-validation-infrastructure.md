@@ -262,6 +262,8 @@ restored even on failure. No telemetry uploader is started. The offline
 oracle, release consent fixture defaults, and the scenario's requests through
 real CLI/backend dry-run validation in each Windows build job. Its missing-network
 control confirms that provision cannot silently inherit a permissive policy.
+Trace fixtures follow `tracerpt` XML: TraceLogging event names are in
+`RenderingInfo/Task`; `System/Task` contains the numeric task ID.
 
 ### IsolationSession Rust test concurrency
 
