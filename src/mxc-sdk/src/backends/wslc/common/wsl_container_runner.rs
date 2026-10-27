@@ -1396,8 +1396,9 @@ impl WSLContainerRunner {
         let forwarding = match (host_stdin, started.stdin.take()) {
             (Some(input), Some(pipe)) => match forward_host_stdin(&started, input, pipe) {
                 Ok(forwarding) => Some(forwarding),
-                Err(error) => {
+                Err((error, pipe)) => {
                     started.quiesce(logger);
+                    drop(pipe);
                     return WslcError::Runtime(format!(
                         "could not start forwarding stdin to the WSL container: {error}"
                     ))
@@ -1490,22 +1491,26 @@ struct ForwardingEnd {
 }
 
 impl HostStdinForwarding {
-    /// Start copying `input` into `pipe`. If forwarding fails before
-    /// [`end_run`](Self::end_run), `stop_run` stops the command and returns
-    /// whether it is known to have stopped.
-    fn start(
+    /// If forwarding fails before [`end_run`](Self::end_run), `stop_run` stops
+    /// the command and returns whether it is known to have stopped.
+    fn start<P: std::io::Write + Send + 'static>(
         mut input: impl Read + Send + 'static,
-        mut pipe: impl std::io::Write + Send + 'static,
+        pipe: P,
         stop_run: impl FnOnce() -> bool + Send + 'static,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, (std::io::Error, P)> {
         let state = Arc::new(Mutex::new(ForwardingState::default()));
         let pump_state = Arc::clone(&state);
+        let pipe_slot = Arc::new(Mutex::new(Some(pipe)));
+        let pump_pipe = Arc::clone(&pipe_slot);
 
         // Never joined: a host stdin that never closes keeps this thread
         // blocked, and the executor exits once the run is over regardless.
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("wslc-host-stdin".to_string())
             .spawn(move || {
+                let Some(mut pipe) = lock(&pump_pipe).take() else {
+                    return;
+                };
                 if let Err(error) = forward_stdin(&mut input, &mut pipe) {
                     let mut state = lock(&pump_state);
                     if !state.run_over {
@@ -1523,8 +1528,12 @@ impl HostStdinForwarding {
                     }
                 }
                 drop(pipe);
-            })?;
-        Ok(Self(state))
+            });
+        let unstarted_pipe = spawned.as_ref().err().and_then(|_| lock(&pipe_slot).take());
+        match (spawned, unstarted_pipe) {
+            (Err(error), Some(pipe)) => Err((error, pipe)),
+            _ => Ok(Self(state)),
+        }
     }
 
     /// Mark the run as over and return what forwarding left before that point;
@@ -1539,19 +1548,26 @@ impl HostStdinForwarding {
     }
 }
 
-/// Also returns an event that signals when a forwarding failure could not stop the command.
-fn forward_host_stdin(
+/// The returned event signals when a forwarding failure could not stop the command.
+fn forward_host_stdin<P: std::io::Write + Send + 'static>(
     started: &StartedContainer,
     input: impl Read + Send + 'static,
-    pipe: impl std::io::Write + Send + 'static,
-) -> std::io::Result<(HostStdinForwarding, std::os::windows::io::OwnedHandle)> {
+    pipe: P,
+) -> Result<(HostStdinForwarding, std::os::windows::io::OwnedHandle), (std::io::Error, P)> {
     use std::os::windows::io::AsRawHandle;
 
-    let exit_event = started
+    let events = started
         .duplicate_exit_event()
-        .map_err(std::io::Error::other)?;
-    let abort = manual_reset_event()?;
-    let signal_abort = abort.try_clone()?;
+        .map_err(std::io::Error::other)
+        .and_then(|exit_event| {
+            let abort = manual_reset_event()?;
+            let signal_abort = abort.try_clone()?;
+            Ok((exit_event, abort, signal_abort))
+        });
+    let (exit_event, abort, signal_abort) = match events {
+        Ok(events) => events,
+        Err(error) => return Err((error, pipe)),
+    };
 
     // SAFETY: the stopper is used only while the run is not over, and
     // `run_internal` ends the run before tearing down.

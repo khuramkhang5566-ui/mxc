@@ -162,15 +162,25 @@ public class MxcContainerWslcE2ETests
     private static async Task<(MxcProcess Process, Stream Stdin)> SpawnCommandWithLateExitAsync()
     {
         var proc = MxcContainer.SpawnWithStdin(Request("sh -c 'sleep 2; head -c 1 >/dev/null'"));
-        var stdin = proc.StandardInput;
-        Assert.NotNull(stdin);
-        var flood = stdin.WriteAsync(new byte[4 * 1024 * 1024], TestContext.Current.CancellationToken).AsTask();
-        await AssertFinishesWithinAsync(flood, TimeSpan.FromSeconds(30), "the command's exit did not release the write");
-        while (!proc.TryGetExitCode(out _))
+        try
         {
-            await Task.Delay(TimeSpan.FromMilliseconds(100), TestContext.Current.CancellationToken);
+            var stdin = proc.StandardInput;
+            Assert.NotNull(stdin);
+            var flood = stdin.WriteAsync(new byte[4 * 1024 * 1024], TestContext.Current.CancellationToken).AsTask();
+            await AssertFinishesWithinAsync(flood, TimeSpan.FromSeconds(30), "the command's exit did not release the write");
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+            while (!proc.TryGetExitCode(out _))
+            {
+                Assert.True(DateTime.UtcNow < deadline, "the command's exit was never reported");
+                await Task.Delay(TimeSpan.FromMilliseconds(100), TestContext.Current.CancellationToken);
+            }
+            return (proc, stdin);
         }
-        return (proc, stdin);
+        catch
+        {
+            proc.Dispose();
+            throw;
+        }
     }
 
     [Fact]
@@ -206,8 +216,12 @@ public class MxcContainerWslcE2ETests
         await Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
         Assert.False(wait.IsCompleted, "the SDK reported the exit on time, so there was no cleanup to wait for");
 
-        await AssertFinishesWithinAsync(Task.Run(() => proc.Warnings, TestContext.Current.CancellationToken), TimeSpan.FromSeconds(5), "Warnings waited for the cleanup");
-        await AssertFinishesWithinAsync(Task.Run(proc.Dispose, TestContext.Current.CancellationToken), TimeSpan.FromSeconds(5), "Dispose waited for the cleanup");
+        var warnings = Task.Run(() => proc.Warnings, TestContext.Current.CancellationToken);
+        await AssertFinishesWithinAsync(warnings, TimeSpan.FromSeconds(5), "Warnings waited for the cleanup");
+        await warnings;
+        var dispose = Task.Run(proc.Dispose, TestContext.Current.CancellationToken);
+        await AssertFinishesWithinAsync(dispose, TimeSpan.FromSeconds(5), "Dispose waited for the cleanup");
+        await dispose;
         await AssertFinishesWithinAsync(wait, TimeSpan.FromSeconds(150), "the command never finished");
         Assert.False((await wait).TimedOut);
         Assert.Throws<ObjectDisposedException>(() => proc.Warnings);

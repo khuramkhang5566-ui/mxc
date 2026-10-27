@@ -596,6 +596,11 @@ public class MxcProcess : IMxcProcess
                 return _finishing;
             }
 
+            // Read before the poll, so a process the poll finds still running
+            // really did outlive its deadline.
+            var deadlinePassed = _timeoutMs is { } timeoutMs &&
+                Stopwatch.GetElapsedTime(_startTimestamp).TotalMilliseconds >= timeoutMs;
+
             // try_wait is intentionally a non-blocking root-process poll.
             // Complete the native wait so a cached timeout is translated
             // into TimedOut and all backend finalization finishes before
@@ -616,8 +621,7 @@ public class MxcProcess : IMxcProcess
             // on Unix), so it would grant a second full budget, up to 2x the
             // policy timeout. Killing the tree first lets the native wait reap
             // an already-dead process.
-            if (_timeoutMs is { } timeoutMs &&
-                Stopwatch.GetElapsedTime(_startTimestamp).TotalMilliseconds >= timeoutMs)
+            if (deadlinePassed)
             {
                 Kill();
                 return StartFinishing(exitCode: null, timedOut: true);
