@@ -398,6 +398,21 @@ On Windows, `deniedPaths` is enforced natively when PSEC advertises
 `PSE_SUPPORT_FS_DENY`; on a host without it, a request with `deniedPaths` is
 rejected before execution.
 
+Windows BaseContainer can also receive access through Windows permissions granted
+to `ALL_APPLICATION_PACKAGES`. An applicable explicit `deniedPaths` rule takes
+precedence over access supplied by that group. Overlapping explicit grants and
+denies are resolved as described below.
+
+The absence of an `ALL_APPLICATION_PACKAGES` grant is not an explicit deny and
+does not by itself cancel access supplied by an explicit MXC path grant.
+
+The [application-package filesystem baseline utility](../src/tools/mxc_filesystem_policy/README.md)
+can document these group-derived directory grants as a compact `filesystem`
+fragment. Its generated deny paths describe missing group grants, not explicit
+MXC policy denials. The fragment is documentation, not a replacement policy.
+Best-effort exports must be read with their coverage report: uninspected paths
+are unknown, even beneath a listed ancestor grant, rather than granted or denied.
+
 #### Overlapping paths for Windows BaseContainer
 
 When paths overlap across `readwritePaths` and `deniedPaths`:

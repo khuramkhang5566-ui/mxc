@@ -9,6 +9,7 @@ members = [
     "tools/lxc",
     "tools/mxc_darwin",
     "tools/mxc_diagnostic_console",
+    "tools/mxc_filesystem_policy",
     "tools/mxc_schema_gen",
     "tools/wxc",
 ]

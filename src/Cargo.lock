@@ -1598,6 +1598,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mxc_filesystem_policy"
+version = "1.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows",
+]
+
+[[package]]
 name = "mxc_schema_gen"
 version = "1.0.1"
 dependencies = [

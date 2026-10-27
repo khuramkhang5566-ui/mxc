@@ -21,6 +21,13 @@ regressions also reject empty selections and skipped SDK streaming cases.
 These checks do not require PSEC; scheduled ProcessContainer hosts execute the
 prebuilt public SDK streaming tests from the Windows SDK test bundle.
 
+Workspace Cargo tests also cover the application-package filesystem baseline
+utility. Its Windows command-line integration tests use disposable directories
+with controlled DACLs to check inherited and explicit grants, empty and nested
+exceptions, principal selection, and rejection of unrepresentable permissions
+without overwriting an existing output. Best-effort cases also verify coverage
+reports and a disposable junction cycle, without changing the strict default.
+
 ### Local Node SDK package validation
 
 From `sdk/node`, run `npm run typecheck` before pushing SDK changes. It builds

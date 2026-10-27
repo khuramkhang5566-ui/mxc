@@ -1,0 +1,25 @@
+[package]
+name = "mxc_filesystem_policy"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Document Windows application-package filesystem grants and baseline exceptions."
+repository = "https://github.com/microsoft/mxc"
+keywords = ["mxc", "windows", "filesystem", "acl", "documentation"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+
+[[bin]]
+name = "mxc-filesystem-policy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
