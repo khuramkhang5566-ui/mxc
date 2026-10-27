@@ -141,7 +141,7 @@ fn enclosing_app_bundle(dir: &Path) -> Option<&Path> {
         .then_some(bundle)
 }
 
-/// Expands `~` in `seatbelt.captureDenials.outputPath` and checks the result.
+/// Expands `~`, validates the output path, and adds `.json` when extensionless.
 pub(crate) fn prepare_capture_output_path(
     request: &ExecutionRequest,
 ) -> Result<Option<String>, String> {
@@ -153,11 +153,17 @@ pub(crate) fn prepare_capture_output_path(
     else {
         return Ok(None);
     };
-    let expanded = expand_tilde(path)?;
+    let mut expanded = expand_tilde(path)?;
     crate::learning_mode_core::capture_output::validate_output_path(
         "seatbelt.captureDenials.outputPath",
         Path::new(&expanded),
     )?;
+    if Path::new(&expanded).extension().is_none() {
+        expanded = Path::new(&expanded)
+            .with_extension("json")
+            .to_string_lossy()
+            .into_owned();
+    }
     Ok(Some(expanded))
 }
 
@@ -438,6 +444,16 @@ mod tests {
             prepare_capture_output_path(&with_path("~/denials.json")).unwrap(),
             Some(format!("{home}/denials.json"))
         );
+        for path in ["~/denials", "~/denials/"] {
+            assert_eq!(
+                prepare_capture_output_path(&with_path(path)).unwrap(),
+                Some(format!("{home}/denials.json"))
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let error = prepare_capture_output_path(&with_path(directory.path().to_str().unwrap()))
+            .unwrap_err();
+        assert!(error.contains("existing directory"), "{error}");
         let error = prepare_capture_output_path(&with_path("denials.json")).unwrap_err();
         assert!(error.contains("must be an absolute path"), "{error}");
         let error =

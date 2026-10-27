@@ -16,8 +16,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # symlink). No config grants this directory, so the read is a default deny.
 TESTDIR="$(mktemp -d /private/tmp/mxc-seatbelt-capture.XXXXXX)"
 trap 'rm -rf "$TESTDIR" "$SEATBELT_TMP"' EXIT
-mkdir -p "$TESTDIR/ungranted" "$TESTDIR/out"
+mkdir -p "$TESTDIR/ungranted" "$TESTDIR/denied" "$TESTDIR/out"
 echo "CAPTURE_SECRET_CONTENT" >"$TESTDIR/ungranted/secret.txt"
+echo "CAPTURE_DENIED_CONTENT" >"$TESTDIR/denied/secret.txt"
 chmod -R a+rX "$TESTDIR"
 SECRET="$TESTDIR/ungranted/secret.txt"
 
@@ -53,7 +54,8 @@ EOF
 run_config "$(render seatbelt_capture_denials_block.json TESTDIR "$TESTDIR" OUTPUT "$TESTDIR/out/denials.json")"
 expect_ok "block mode still enforces the policy" "CAPTURE_READ_BLOCKED"
 expect_absent "block mode does not leak the file" "CAPTURE_SECRET_CONTENT"
-read_pointer "block mode writes a report"
+expect_marker "block mode preserves unterminated workload stderr" "CAPTURE_STDERR_UNTERMINATED"
+read_pointer "block mode separates the report pointer from unterminated stderr"
 expect_listed "block mode lists the denied read" file "$SECRET" read
 
 case "$REPORT" in
@@ -76,9 +78,34 @@ pass "the verbose report is a v6 seatbelt document"
 
 run_config "$(render seatbelt_capture_denials_allow.json TESTDIR "$TESTDIR" OUTPUT "$TESTDIR/out/denials.json")"
 expect_ok "allow mode lets the default-denied read through" "CAPTURE_SECRET_CONTENT"
+expect_ok "allow mode still blocks an explicitly denied read" "CAPTURE_EXPLICIT_READ_BLOCKED"
+expect_absent "allow mode does not leak an explicitly denied file" "CAPTURE_DENIED_CONTENT"
 expect_marker "allow mode warns that the policy was not enforced" "ran the workload without enforcing"
 read_pointer "allow mode writes a report"
 expect_listed "allow mode still lists the read" file "$SECRET" read
+expect_listed "allow mode lists the explicitly denied read" file "$TESTDIR/denied/secret.txt" read
+
+# --- repeated captures with an extensionless outputPath ----------------------
+
+PREVIOUS_REPORT=""
+for run in 1 2; do
+    run_config "$(render seatbelt_capture_denials_block.json TESTDIR "$TESTDIR" OUTPUT "$TESTDIR/out/extensionless")"
+    expect_ok "extensionless capture $run still enforces the policy" "CAPTURE_READ_BLOCKED"
+    read_pointer "extensionless capture $run writes a report"
+    expect_listed "extensionless capture $run lists the denied read" file "$SECRET" read
+    case "$REPORT" in
+        "$TESTDIR/out/extensionless."*.json) ;;
+        *) fail "extensionless capture did not get a per-run JSON name: $REPORT" ;;
+    esac
+    [ -f "${REPORT%.json}.verbose.json" ] || fail "extensionless capture has no verbose report: $REPORT"
+    if [ -n "$PREVIOUS_REPORT" ]; then
+        [ "$REPORT" != "$PREVIOUS_REPORT" ] || fail "repeated captures reused a report path: $REPORT"
+        [ -f "$PREVIOUS_REPORT" ] && [ -f "${PREVIOUS_REPORT%.json}.verbose.json" ] ||
+            fail "repeated capture removed the previous report pair"
+    fi
+    PREVIOUS_REPORT="$REPORT"
+done
+pass "repeated extensionless captures keep distinct report pairs"
 
 # --- --audit -----------------------------------------------------------------
 
@@ -92,16 +119,36 @@ rm -f "$REPORT" "${REPORT%.json}.verbose.json"
 
 # ui.clipboard=none must survive the guiAccess blanket Mach grant, and the
 # report must attribute the blocked pasteboard to UI rather than "other".
-run_config "$(render seatbelt_capture_denials_gui_clipboard_none.json OUTPUT "$TESTDIR/out/gui.json")"
-expect_ok "the pasteboard stays blocked under guiAccess" "CLIPBOARD_BLOCKED"
-read_pointer "the guiAccess run writes a report"
-/usr/bin/python3 - "$REPORT" <<'EOF' || fail "the pasteboard denial is not reported as ui" "$(cat "$REPORT")"
+for scenario in allow:all block:none allow:none; do
+    mode="${scenario%:*}"
+    clipboard="${scenario#*:}"
+    config="$(render seatbelt_capture_denials_gui_clipboard_none.json OUTPUT "$TESTDIR/out/clipboard.json")"
+    /usr/bin/python3 - "$config" "$mode" "$clipboard" <<'EOF' || fail "could not prepare clipboard capture config"
+import json, sys
+path, mode, clipboard = sys.argv[1:]
+with open(path) as source:
+    config = json.load(source)
+config["seatbelt"]["captureDenials"]["mode"] = mode
+config["ui"]["clipboard"] = clipboard
+with open(path, "w") as output:
+    json.dump(config, output)
+EOF
+    run_config "$config"
+    if [ "$clipboard" = all ]; then
+        expect_ok "allow mode permits the pasteboard when granted under guiAccess" "CLIPBOARD_OK"
+        read_pointer "the allowed pasteboard control writes a report"
+        continue
+    fi
+    expect_ok "$mode mode keeps the pasteboard blocked under guiAccess" "CLIPBOARD_BLOCKED"
+    read_pointer "$mode mode with guiAccess writes a report"
+    /usr/bin/python3 - "$REPORT" <<'EOF' || fail "$mode mode pasteboard denial is not reported as ui" "$(cat "$REPORT")"
 import json, sys
 doc = json.load(open(sys.argv[1]))
 assert any(d["resourceType"] == "ui" and "com.apple.pasteboard" in d["resource"]
            for d in doc["denials"])
 EOF
-pass "the pasteboard denial is reported as ui"
+    pass "$mode mode pasteboard denial is reported as ui"
+done
 
 # --- a real GUI app: which Mach services and IOKit drivers it needs ----------
 

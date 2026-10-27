@@ -212,8 +212,9 @@ fn run_seatbelt(request: &ExecutionRequest, logger: &mut Logger) -> ! {
         .as_ref()
         .and_then(|metadata| metadata.capture_denials.as_ref())
     {
+        // Workloads inherit stderr and may leave the last line unterminated.
         match serde_json::to_string(pointer) {
-            Ok(line) => eprintln!("{line}"),
+            Ok(line) => eprintln!("\n{line}"),
             Err(error) => eprintln!("failed to serialize captureDenials output pointer: {error}"),
         }
     }

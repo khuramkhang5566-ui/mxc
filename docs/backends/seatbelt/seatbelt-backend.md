@@ -414,7 +414,8 @@ use `mxc-exec-mac` instead.
 | `outputPath` | a temp file | Absolute path, or one starting with `~/`. The parent directory must exist. |
 
 MXC adds a per-run ID to the file name (`denials.json` becomes
-`denials.<pid>_<id>.json`), writes a `.verbose.json` file next to it, and
+`denials.<pid>_<id>.json`). Names without an extension get `.json` first.
+MXC writes a `.verbose.json` file next to it and
 prints the actual path on stderr as a JSON line:
 
 ```json
@@ -422,6 +423,8 @@ prints the actual path on stderr as a JSON line:
 ```
 
 The report uses the [same format as Windows](../../logging-access-denied.md#output-file-the-caller-consumes).
+`deniedResourcesTruncated: true` means some denials may be missing, including
+when a captured report could not be parsed.
 
 `mxc-exec-mac --audit config.json` is a shortcut that runs the
 config with `captureDenials` in `"allow"` mode and writes the report to a temp

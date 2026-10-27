@@ -319,6 +319,7 @@ pub(crate) fn analyze_events(
 
     for event in events {
         let Some(report) = parse_report(&event.message) else {
+            denied_resources_truncated = true;
             let signature = CaptureVerboseLoggingSignature {
                 provider: CaptureVerboseLoggingProvider::Seatbelt,
                 provider_guid: SEATBELT_PROVIDER_ID.to_string(),
@@ -490,7 +491,7 @@ mod tests {
     fn analysis_maps_reports_to_denials_and_verbose_signatures() {
         let mut grant = event("Sandbox: app(7) allow mach-lookup com.apple.nsurlsessiond");
         grant.message.push_str(GRANT_TAG_SUFFIX);
-        let events = vec![
+        let mut events = vec![
             event("Sandbox: cat(7) deny(1) file-read-data /Users/me/secret.txt"),
             event("2 duplicate reports for Sandbox: cat(7) deny(1) file-read-data /Users/me/secret.txt"),
             event("Sandbox: cat(7) deny(1) file-write-create /tmp/out"),
@@ -501,10 +502,12 @@ mod tests {
             event(r#"Sandbox: app(7) deny(1) file-ioctl path:/dev/dtracehelper ioctl-command:(_IO "h" 4)"#),
             event(r#"Sandbox: app(7) deny(1) file-ioctl path:/dev/ttys001 ioctl-command:(_IO "t" 1)"#),
             grant,
-            event("not a sandbox report"),
         ];
 
+        assert!(!analyze_events(&events, false).denied_resources_truncated);
+        events.push(event("not a sandbox report"));
         let analysis = analyze_events(&events, false);
+        assert!(analysis.denied_resources_truncated);
 
         let denials: Vec<_> = analysis
             .denials

@@ -3,7 +3,7 @@
     "version": "1.1.0-alpha",
     "containment": "seatbelt",
     "process": {
-        "commandLine": "cat {{TESTDIR}}/ungranted/secret.txt && echo CAPTURE_READ_OK || echo CAPTURE_READ_BLOCKED",
+        "commandLine": "cat {{TESTDIR}}/ungranted/secret.txt && echo CAPTURE_READ_OK || echo CAPTURE_READ_BLOCKED; printf CAPTURE_STDERR_UNTERMINATED >&2",
         "timeout": 20000
     },
     "seatbelt": {
