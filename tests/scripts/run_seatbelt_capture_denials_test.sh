@@ -15,7 +15,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Under /private/tmp so the logged path matches what we assert on (/tmp is a
 # symlink). No config grants this directory, so the read is a default deny.
 TESTDIR="$(mktemp -d /private/tmp/mxc-seatbelt-capture.XXXXXX)"
-trap 'rm -rf "$TESTDIR" "$SEATBELT_TMP"' EXIT
+LISTENER_PID=""
+cleanup_capture() {
+    if [ -n "$LISTENER_PID" ]; then
+        kill "$LISTENER_PID" 2>/dev/null || true
+        wait "$LISTENER_PID" 2>/dev/null || true
+    fi
+    rm -rf "$TESTDIR" "$SEATBELT_TMP"
+}
+trap cleanup_capture EXIT
 mkdir -p "$TESTDIR/ungranted" "$TESTDIR/denied" "$TESTDIR/out"
 echo "CAPTURE_SECRET_CONTENT" >"$TESTDIR/ungranted/secret.txt"
 echo "CAPTURE_DENIED_CONTENT" >"$TESTDIR/denied/secret.txt"
@@ -114,6 +122,97 @@ expect_ok "--audit runs the workload in allow mode" "CAPTURE_SECRET_CONTENT"
 read_pointer "--audit writes a report"
 expect_listed "--audit lists the read" file "$SECRET" read
 rm -f "$REPORT" "${REPORT%.json}.verbose.json"
+
+# --- timeout plus report-write failure --------------------------------------
+
+mkdir "$TESTDIR/timeout-out"
+run_config "$(render seatbelt_capture_denials_timeout.json TESTDIR "$TESTDIR")"
+[ "$RC" != 0 ] || fail "timeout plus capture failure must fail" "$OUT"
+expect_marker "the workload removed the report directory before timing out" "CAPTURE_OUTPUT_REMOVED"
+expect_absent "a failed capture does not emit a success pointer" '"type":"captureDenials"'
+ERROR_LINE="$(grep -m1 '^{"error":' <<<"$OUT")" || fail "timeout has no error envelope" "$OUT"
+/usr/bin/python3 - "$ERROR_LINE" "$TESTDIR/timeout-out" <<'EOF' || fail "timeout lost the capture-write diagnostic" "$OUT"
+import json, sys
+error = json.loads(sys.argv[1])["error"]
+assert error["code"] == "backend_error"
+assert "script timed out after 1000ms" in error["message"]
+assert "captureDenials teardown also failed:" in error["message"]
+assert "failed to create temporary actionable output file" in error["message"]
+assert sys.argv[2] in error["message"]
+EOF
+pass "timeout preserves the capture-write diagnostic in the CLI error"
+
+# --- allow-mode host-loopback policy and proxy exception ---------------------
+
+require_python3_probe
+/usr/bin/python3 -c '
+import socket, time
+listeners = [socket.socket(), socket.socket()]
+for listener in listeners:
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(16)
+print(*(listener.getsockname()[1] for listener in listeners), flush=True)
+time.sleep(600)
+' >"$TESTDIR/ports" &
+LISTENER_PID=$!
+for _ in $(seq 1 50); do
+    if [ -s "$TESTDIR/ports" ]; then
+        read -r PORT PROXY_PORT <"$TESTDIR/ports"
+        break
+    fi
+    kill -0 "$LISTENER_PID" 2>/dev/null || fail "capture network listeners exited"
+    sleep 0.1
+done
+[ -n "${PORT:-}" ] && [ -n "${PROXY_PORT:-}" ] || fail "capture network listeners did not publish their ports"
+/usr/bin/python3 - "$PORT" "$PROXY_PORT" <<'EOF' || fail "host cannot reach the capture network listeners"
+import socket, sys
+for port in sys.argv[1:]:
+    socket.create_connection(("127.0.0.1", int(port)), timeout=2).close()
+EOF
+pass "both host loopback listeners are reachable before capture"
+
+for scenario in deny allow proxy; do
+    config="$(render seatbelt_capture_denials_network.json PORT "$PORT" PROXY_PORT "$PROXY_PORT" OUTPUT "$TESTDIR/out/network.json")"
+    /usr/bin/python3 - "$config" "$scenario" "$PROXY_PORT" <<'EOF' || fail "could not prepare network capture config"
+import json, sys
+path, scenario, port = sys.argv[1:]
+with open(path) as source:
+    config = json.load(source)
+if scenario == "allow":
+    config["network"]["ingress"]["hostLoopback"] = "allow"
+elif scenario == "proxy":
+    config["runtimeConfig"] = {"networkProxy": f"http://127.0.0.1:{port}"}
+with open(path, "w") as output:
+    json.dump(config, output)
+EOF
+    run_config "$config"
+    case "$scenario" in
+        deny)
+            expect_ok "allow mode enforces hostLoopback=deny" "LOOPBACK_BLOCKED"
+            expect_marker "hostLoopback=deny blocks the second host port" "PROXY_BLOCKED"
+            ;;
+        allow)
+            expect_ok "allow mode preserves an explicit host-loopback grant" "LOOPBACK_OK"
+            expect_marker "the loopback grant reaches both host ports" "PROXY_OK"
+            ;;
+        proxy)
+            expect_ok "allow mode keeps non-proxy host ports blocked" "LOOPBACK_BLOCKED"
+            expect_marker "the configured proxy port remains reachable" "PROXY_OK"
+            ;;
+    esac
+    read_pointer "$scenario loopback capture writes a report"
+    /usr/bin/python3 - "$REPORT" "$scenario" "$PORT" "$PROXY_PORT" <<'EOF' || fail "$scenario loopback report misclassifies blocked or granted connections" "$(cat "$REPORT")"
+import json, sys
+path, scenario, host_port, proxy_port = sys.argv[1:]
+with open(path) as source:
+    denials = json.load(source)["denials"]
+for port, blocked in [(host_port, scenario != "allow"), (proxy_port, scenario == "deny")]:
+    listed = any(d["resourceType"] == "network"
+                 and d["resource"] == f"network-outbound:remote:*:{port}" for d in denials)
+    assert listed == blocked, (port, blocked, denials)
+EOF
+    pass "$scenario loopback capture reports denied connections, not explicit grants"
+done
 
 # --- UI denials under guiAccess ---------------------------------------------
 

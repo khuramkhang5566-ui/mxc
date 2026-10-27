@@ -425,6 +425,8 @@ prints the actual path on stderr as a JSON line:
 The report uses the [same format as Windows](../../logging-access-denied.md#output-file-the-caller-consumes).
 `deniedResourcesTruncated: true` means some denials may be missing, including
 when a captured report could not be parsed.
+If a workload times out and capture collection or report writing also fails,
+the timeout error includes the capture failure reason.
 
 `mxc-exec-mac --audit config.json` is a shortcut that runs the
 config with `captureDenials` in `"allow"` mode and writes the report to a temp

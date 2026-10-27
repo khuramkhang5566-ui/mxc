@@ -124,7 +124,7 @@ pub(crate) fn build_profile_with_terminals(
 
     let mut out = String::with_capacity(2048);
 
-    // Header — Apple's Seatbelt requires `(version 1)` and we baseline with deny-default.
+    // Capture allow mode replaces the normal deny-default baseline.
     out.push_str("(version 1)\n");
     match &capture {
         Some(rules) if rules.allow_mode => {
@@ -163,7 +163,12 @@ pub(crate) fn build_profile_with_terminals(
     // Policy-derived allow rules.
     let resolved = ResolvedPaths::from_inputs(inputs);
     write_filesystem_allow(&mut out, &resolved);
-    write_network_rules(&mut out, request, proxy_address);
+    write_network_rules(
+        &mut out,
+        request,
+        proxy_address,
+        capture.as_ref().is_some_and(|rules| rules.allow_mode),
+    );
     write_nested_pty_rules(&mut out, request);
     write_keychain_rules(&mut out, request, inputs.user_keychains.as_deref())?;
     write_extra_seatbelt_rules(&mut out, request);
@@ -386,13 +391,13 @@ fn write_network_rules(
     out: &mut String,
     request: &ExecutionRequest,
     proxy_address: Option<&ProxyAddress>,
+    allow_default: bool,
 ) {
     let policy = &request.policy;
     let allow_outbound = seatbelt_policy::egress_allowed(policy);
     match allow_outbound {
         false => {
-            // Pure deny — implicit from `(deny default)`.
-            out.push_str(";; --- network: default-deny (no allow-network rules emitted) ---\n");
+            out.push_str(";; --- network: default-deny egress (no general outbound grant) ---\n");
         }
         true => {
             out.push_str(";; --- network: outbound allowed (any host) ---\n");
@@ -400,12 +405,9 @@ fn write_network_rules(
         }
     }
 
-    write_host_loopback_rules(out, policy, allow_outbound);
+    write_host_loopback_rules(out, policy, allow_outbound, allow_default);
 
-    // Emitted last on purpose: among rules whose filters both match, Seatbelt
-    // takes the *last* one. Nothing here denies `localhost` today — the deny
-    // arm needs an open egress default, which skips the proxy entirely — so
-    // going last keeps the port-scoped allow safe if that ever changes.
+    // The proxy port must override the broader host-loopback deny.
     if !allow_outbound {
         if let Some(address) = proxy_address {
             write_proxy_reachability_rules(out, address);
@@ -426,14 +428,17 @@ fn write_network_rules(
 /// where this rule enforces the container-to-host half and the blanket
 /// `network-inbound` grant over-permits the host-to-container half.
 ///
-/// Only the two combinations that actually change the profile emit anything;
-/// deny-under-deny is already covered by `(deny default)`, and allow-under-allow
-/// is already covered by the blanket outbound allow.
-fn write_host_loopback_rules(out: &mut String, policy: &ContainerPolicy, allow_outbound: bool) {
+/// Capture allow mode needs an explicit deny even when authored egress is deny.
+fn write_host_loopback_rules(
+    out: &mut String,
+    policy: &ContainerPolicy,
+    allow_outbound: bool,
+    allow_default: bool,
+) {
     let loopback_allowed = seatbelt_policy::host_loopback_allowed(policy);
 
     match (loopback_allowed, allow_outbound) {
-        (false, true) => {
+        (false, _) if allow_outbound || allow_default => {
             // `localhost` matches this machine on any of its addresses, so this
             // also closes the "reach the host via its LAN IP" path.
             out.push_str(";; --- network: ingress.hostLoopback=deny — close host loopback,\n");
@@ -461,21 +466,8 @@ fn write_outbound_allow_rules(out: &mut String) {
     out.push_str("(allow system-socket)\n");
 }
 
-/// Emit the outbound rules that let the sandbox reach the proxy while the
-/// default policy stays deny.
-///
-/// Only called from the default-deny arms of [`write_network_rules`], so
-/// everything here sits under a `(deny default)` baseline.
-///
-/// A loopback proxy is scoped to its exact `localhost:<port>`, so clients that
-/// ignore `HTTP_PROXY` can't reach any other port or machine. Note the scoping
-/// is by port, not by address: `localhost` means "this machine", so the rule
-/// also covers the host's non-loopback addresses on that same port. A
-/// non-loopback proxy can't be expressed at all — Seatbelt's `(remote ip ...)`
-/// matches neither DNS names nor specific addresses — so it fails closed. The
-/// backend validator rejects that combination before profile construction;
-/// failing closed here keeps any future disagreement about what counts as
-/// loopback from silently opening up egress.
+/// Grant proxy reachability under authored deny-egress, after any loopback deny.
+/// `localhost:<port>` covers every host address; non-loopback proxies are rejected.
 fn write_proxy_reachability_rules(out: &mut String, proxy_address: &ProxyAddress) {
     if host_is_canonical_loopback(proxy_address.host()) {
         let _ = writeln!(
@@ -1868,6 +1860,39 @@ mod tests {
         assert!(p.contains(
             "(deny file-read* file-read-metadata file-write* network-bind network-outbound (with message \"mxc-capture-test\")\n"
         ));
+    }
+
+    #[test]
+    fn capture_allow_mode_preserves_loopback_policy_and_proxy_exception() {
+        let inputs = ProfileInputs {
+            capture_tag: Some("mxc-capture-test".into()),
+            ..Default::default()
+        };
+        let proxy = ProxyAddress::new("127.0.0.1".into(), 44444);
+        for loopback in [NetworkAction::Deny, NetworkAction::Allow] {
+            let mut request = capture_request(CaptureDenialsMode::Allow, false);
+            request.policy.network_egress = Some(egress(NetworkAction::Deny));
+            request.policy.network_ingress =
+                Some(crate::mxc_common::models::NetworkIngressPolicy {
+                    default: NetworkAction::Allow,
+                    host_loopback: loopback,
+                });
+            let loopback_rule = match loopback {
+                NetworkAction::Deny =>
+                    "(deny network-outbound (with message \"mxc-capture-test\") (remote ip \"localhost:*\"))",
+                NetworkAction::Allow =>
+                    "(allow network-outbound (remote ip \"localhost:*\"))",
+            };
+            let profile = super::build_profile_with_proxy(&request, None, &inputs).unwrap();
+            assert!(profile.contains(loopback_rule), "{profile}");
+
+            let profile = super::build_profile_with_proxy(&request, Some(&proxy), &inputs).unwrap();
+            let loopback_position = profile.find(loopback_rule).expect("loopback rule");
+            let proxy_position = profile
+                .find("(allow network-outbound (remote ip \"localhost:44444\"))")
+                .expect("proxy-port exception");
+            assert!(proxy_position > loopback_position, "{profile}");
+        }
     }
 
     #[test]
