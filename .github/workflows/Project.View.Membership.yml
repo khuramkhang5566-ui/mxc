@@ -25,7 +25,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: project-view-membership-${{ github.event.issue.number || github.event.pull_request.number || 'reconcile' }}
+  group: project-view-membership-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'reconcile' }}
   cancel-in-progress: false
 
 jobs:
@@ -59,12 +59,7 @@ jobs:
       - name: Synchronize view membership
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
         shell: bash
         run: |
           set -euo pipefail
-          args=(--repo "$GITHUB_REPOSITORY" --apply)
-          if [[ -n "$ISSUE_NUMBER" ]]; then
-            args+=(--issue "$ISSUE_NUMBER")
-          fi
-          node scripts/sync-project-view-membership.cjs "${args[@]}"
+          node scripts/sync-project-view-membership.cjs --repo "$GITHUB_REPOSITORY" --apply

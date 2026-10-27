@@ -17,6 +17,8 @@ Keep Labels hidden in the tables and retain manual ordering and native Type.
 The workflow reacts to issue and assignment changes and reconciles every open
 issue hourly. It also supports manual dispatch. It uses the repository
 `GITHUB_TOKEN` with `issues: write`, not an organization-project token.
+Reconciliations are serialized and always cover every open issue, so coalesced
+events do not lose an update and scheduled runs cannot overwrite event updates.
 Pull request runs only test the implementation and cannot write issue labels.
 The synchronizer never changes assignees, milestones, issue bodies, or comments.
 It only adds and removes its configured derived labels.
