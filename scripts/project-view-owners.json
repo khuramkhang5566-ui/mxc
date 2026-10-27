@@ -1,0 +1,116 @@
+{
+  "mgudgin": {
+    "labels": [
+      "Backend-ProcessContainer",
+      "Backend-ProcessContainer-UI",
+      "Area-Execution",
+      "Area-DotNet-SDK",
+      "Area-Node-SDK",
+      "Area-Rust-SDK",
+      "Area-Schema",
+      "Needs-Triage",
+      "Backend-VM"
+    ],
+    "excludeLabels": [
+      "Backend-ProcessContainer-Networking",
+      "Backend-ProcessContainer-Filesystem",
+      "Backend-ProcessContainer-learningmode"
+    ]
+  },
+  "denelon": {
+    "labels": [
+      "Backend-ProcessContainer",
+      "Needs-Triage"
+    ],
+    "excludeLabels": []
+  },
+  "bbonaby": {
+    "labels": [
+      "Backend-ProcessContainer",
+      "Backend-ProcessContainer-Networking",
+      "Area-Execution",
+      "Area-DotNet-SDK",
+      "Area-Node-SDK",
+      "Area-Rust-SDK",
+      "Area-Schema",
+      "Area-Build",
+      "Area-Test",
+      "Needs-Triage"
+    ],
+    "excludeLabels": [
+      "Backend-ProcessContainer-UI",
+      "Backend-ProcessContainer-Filesystem",
+      "Backend-ProcessContainer-learningmode"
+    ]
+  },
+  "daniedud-MSFT": {
+    "labels": [
+      "Backend-ProcessContainer-Filesystem"
+    ],
+    "excludeLabels": []
+  },
+  "jsidewhite": {
+    "labels": [
+      "Backend-ProcessContainer",
+      "Area-DotNet-SDK",
+      "Area-Node-SDK",
+      "Area-Rust-SDK",
+      "Area-Schema"
+    ],
+    "excludeLabels": [
+      "Backend-ProcessContainer-UI",
+      "Backend-ProcessContainer-Networking",
+      "Backend-ProcessContainer-Filesystem",
+      "Backend-ProcessContainer-learningmode"
+    ]
+  },
+  "SohamDas2021": {
+    "labels": [
+      "Backend-Bubblewrap",
+      "Backend-WSLC"
+    ],
+    "excludeLabels": []
+  },
+  "dhoehna": {
+    "labels": [
+      "Backend-LXC",
+      "Area-Build",
+      "Area-Test"
+    ],
+    "excludeLabels": []
+  },
+  "theelliotm": {
+    "labels": [
+      "Backend-Seatbelt",
+      "Area-Build",
+      "Area-Test",
+      "OS-MacOS"
+    ],
+    "excludeLabels": []
+  },
+  "richiemsft": {
+    "labels": [
+      "Backend-ProcessContainer-learningmode",
+      "Area-Telemetry"
+    ],
+    "excludeLabels": []
+  },
+  "adpa-ms": {
+    "labels": [
+      "Backend-IsolationSession"
+    ],
+    "excludeLabels": []
+  },
+  "huzaifa-d": {
+    "labels": [
+      "Backend-MicroVM"
+    ],
+    "excludeLabels": []
+  },
+  "danbugs": {
+    "labels": [
+      "Backend-Hyperlight"
+    ],
+    "excludeLabels": []
+  }
+}

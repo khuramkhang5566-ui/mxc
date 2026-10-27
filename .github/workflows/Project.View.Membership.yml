@@ -1,0 +1,70 @@
+name: Project View Membership
+
+on:
+  issues:
+    types:
+      - opened
+      - reopened
+      - edited
+      - labeled
+      - unlabeled
+      - assigned
+      - unassigned
+      - closed
+      - transferred
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/Project.View.Membership.yml
+      - scripts/project-view-owners.json
+      - scripts/sync-project-view-membership.cjs
+      - scripts/tests/project-view-membership.test.cjs
+
+permissions: {}
+
+concurrency:
+  group: project-view-membership-${{ github.event.issue.number || github.event.pull_request.number || 'reconcile' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: node --test scripts/tests/project-view-membership.test.cjs
+
+  sync:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Synchronize view membership
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--repo "$GITHUB_REPOSITORY" --apply)
+          if [[ -n "$ISSUE_NUMBER" ]]; then
+            args+=(--issue "$ISSUE_NUMBER")
+          fi
+          node scripts/sync-project-view-membership.cjs "${args[@]}"
