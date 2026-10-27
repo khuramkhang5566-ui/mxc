@@ -45,6 +45,7 @@ pub(crate) fn prepare_profile(request: &ExecutionRequest) -> Result<ProfileInput
         denied_paths,
         developer_dir,
         user_keychains,
+        capture_tag: None,
     })
 }
 
@@ -138,6 +139,26 @@ fn enclosing_app_bundle(dir: &Path) -> Option<&Path> {
         .extension()?
         .eq_ignore_ascii_case("app")
         .then_some(bundle)
+}
+
+/// Expands `~` in `seatbelt.captureDenials.outputPath` and checks the result.
+pub(crate) fn prepare_capture_output_path(
+    request: &ExecutionRequest,
+) -> Result<Option<String>, String> {
+    let Some(path) = request
+        .seatbelt
+        .as_ref()
+        .and_then(|config| config.capture_denials.as_ref())
+        .and_then(|capture| capture.output_path.as_deref())
+    else {
+        return Ok(None);
+    };
+    let expanded = expand_tilde(path)?;
+    crate::learning_mode_core::capture_output::validate_output_path(
+        "seatbelt.captureDenials.outputPath",
+        Path::new(&expanded),
+    )?;
+    Ok(Some(expanded))
 }
 
 #[cfg(test)]
@@ -397,5 +418,34 @@ mod tests {
         let profile = build_profile_with_proxy(&request, None, &inputs).unwrap();
         let granted = developer_dir_grant_root(&dir);
         assert!(profile.contains(&format!("(subpath \"{}\")", granted.display())));
+    }
+
+    #[test]
+    fn capture_output_path_expands_tilde_then_validates() {
+        let with_path = |path: &str| ExecutionRequest {
+            seatbelt: Some(SeatbeltConfig {
+                capture_denials: Some(crate::mxc_common::models::CaptureDenialsConfig {
+                    output_path: Some(path.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let home = std::env::var("HOME").unwrap();
+
+        assert_eq!(
+            prepare_capture_output_path(&with_path("~/denials.json")).unwrap(),
+            Some(format!("{home}/denials.json"))
+        );
+        let error = prepare_capture_output_path(&with_path("denials.json")).unwrap_err();
+        assert!(error.contains("must be an absolute path"), "{error}");
+        let error =
+            prepare_capture_output_path(&with_path("~/mxc-missing-dir/denials.json")).unwrap_err();
+        assert!(error.contains("parent directory does not exist"), "{error}");
+        assert_eq!(
+            prepare_capture_output_path(&ExecutionRequest::default()).unwrap(),
+            None
+        );
     }
 }
