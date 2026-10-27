@@ -118,10 +118,12 @@ public class MxcProcess : IMxcProcess
     private readonly MxcSandboxHandle _handle;
     private bool _disposed;
 
-    // Set while a wait that has already seen the process exit is finishing
-    // inside the native wait, which holds _controlLock and can take up to a
-    // minute on WSLC.
-    private volatile bool _finishingExitedWait;
+    // Takes up to a minute on WSLC. While it runs, nothing else may use the native handle.
+    private Task<WaitResult>? _finishing;
+    private bool _isFinishing;
+    private uint? _id;
+    private int? _exitBeforeFinishing;
+    private IReadOnlyList<string> _warningsBeforeFinishing = Array.Empty<string>();
 
     // Tracks whether each readable standard stream is still available, has been
     // handed to the caller, or is being consumed by an internal drain task. A
@@ -176,11 +178,17 @@ public class MxcProcess : IMxcProcess
             lock (_controlLock)
             {
                 ThrowIfDisposed();
-                unsafe
-                {
-                    return NativeMethods.mxc_sandbox_id(_handle.Ptr);
-                }
+                _id ??= ReadId();
+                return _id.Value;
             }
+        }
+    }
+
+    private uint ReadId()
+    {
+        unsafe
+        {
+            return NativeMethods.mxc_sandbox_id(_handle.Ptr);
         }
     }
 
@@ -198,18 +206,27 @@ public class MxcProcess : IMxcProcess
             lock (_controlLock)
             {
                 ThrowIfDisposed();
-                if (!_stdinTaken)
+                if (_stdinTaken)
                 {
-                    _stdinTaken = true;
-                    unsafe
-                    {
-                        var s = NativeMethods.mxc_sandbox_take_stdin(_handle.Ptr);
-                        _stdin = s is null ? null : new MxcStdinStream(MxcWriteStreamHandle.FromRaw(s));
-                    }
+                    return _stdin;
                 }
-                return _stdin;
+            }
+            return WhenNotFinishing(TakeStdin);
+        }
+    }
+
+    private Stream? TakeStdin()
+    {
+        if (!_stdinTaken)
+        {
+            _stdinTaken = true;
+            unsafe
+            {
+                var s = NativeMethods.mxc_sandbox_take_stdin(_handle.Ptr);
+                _stdin = s is null ? null : new MxcStdinStream(MxcWriteStreamHandle.FromRaw(s));
             }
         }
+        return _stdin;
     }
 
     /// <summary>
@@ -260,6 +277,10 @@ public class MxcProcess : IMxcProcess
     /// Security warnings emitted while applying the container policy, and
     /// cleanup steps that failed after the workload exited.
     /// </summary>
+    /// <remarks>
+    /// While a wait is finishing the process's cleanup, this returns the
+    /// warnings from before that cleanup began.
+    /// </remarks>
     public IReadOnlyList<string> Warnings
     {
         get
@@ -267,32 +288,37 @@ public class MxcProcess : IMxcProcess
             lock (_controlLock)
             {
                 ThrowIfDisposed();
-                unsafe
-                {
-                    byte* json = null;
-                    var status = NativeMethods.mxc_sandbox_warnings_json(_handle.Ptr, &json);
-                    if (status != (int)ErrorCode.Success)
-                    {
-                        throw new MxcException(
-                            (ErrorCode)status,
-                            "retrieving sandbox security warnings failed");
-                    }
-                    if (json is null)
-                    {
-                        return Array.Empty<string>();
-                    }
-                    try
-                    {
-                        var text = Marshal.PtrToStringUTF8((IntPtr)json);
-                        return string.IsNullOrEmpty(text)
-                            ? Array.Empty<string>()
-                            : MxcJson.Deserialize<string[]>(text) ?? Array.Empty<string>();
-                    }
-                    finally
-                    {
-                        NativeMethods.mxc_string_free(json);
-                    }
-                }
+                return _isFinishing ? _warningsBeforeFinishing : ReadWarnings();
+            }
+        }
+    }
+
+    private IReadOnlyList<string> ReadWarnings()
+    {
+        unsafe
+        {
+            byte* json = null;
+            var status = NativeMethods.mxc_sandbox_warnings_json(_handle.Ptr, &json);
+            if (status != (int)ErrorCode.Success)
+            {
+                throw new MxcException(
+                    (ErrorCode)status,
+                    "retrieving sandbox security warnings failed");
+            }
+            if (json is null)
+            {
+                return Array.Empty<string>();
+            }
+            try
+            {
+                var text = Marshal.PtrToStringUTF8((IntPtr)json);
+                return string.IsNullOrEmpty(text)
+                    ? Array.Empty<string>()
+                    : MxcJson.Deserialize<string[]>(text) ?? Array.Empty<string>();
+            }
+            finally
+            {
+                NativeMethods.mxc_string_free(json);
             }
         }
     }
@@ -308,32 +334,37 @@ public class MxcProcess : IMxcProcess
             lock (_controlLock)
             {
                 ThrowIfDisposed();
-                unsafe
-                {
-                    byte* json = null;
-                    var status = NativeMethods.mxc_sandbox_output_metadata_json(_handle.Ptr, &json);
-                    if (status != (int)ErrorCode.Success)
-                    {
-                        throw new MxcException(
-                            (ErrorCode)status,
-                            "retrieving sandbox output metadata failed");
-                    }
-                    if (json is null)
-                    {
-                        return null;
-                    }
-                    try
-                    {
-                        var text = Marshal.PtrToStringUTF8((IntPtr)json);
-                        return string.IsNullOrEmpty(text)
-                            ? null
-                            : MxcJson.Deserialize<ExecutionMetadata>(text);
-                    }
-                    finally
-                    {
-                        NativeMethods.mxc_string_free(json);
-                    }
-                }
+                return _isFinishing ? null : ReadOutputMetadata();
+            }
+        }
+    }
+
+    private ExecutionMetadata? ReadOutputMetadata()
+    {
+        unsafe
+        {
+            byte* json = null;
+            var status = NativeMethods.mxc_sandbox_output_metadata_json(_handle.Ptr, &json);
+            if (status != (int)ErrorCode.Success)
+            {
+                throw new MxcException(
+                    (ErrorCode)status,
+                    "retrieving sandbox output metadata failed");
+            }
+            if (json is null)
+            {
+                return null;
+            }
+            try
+            {
+                var text = Marshal.PtrToStringUTF8((IntPtr)json);
+                return string.IsNullOrEmpty(text)
+                    ? null
+                    : MxcJson.Deserialize<ExecutionMetadata>(text);
+            }
+            finally
+            {
+                NativeMethods.mxc_string_free(json);
             }
         }
     }
@@ -370,31 +401,48 @@ public class MxcProcess : IMxcProcess
         }
     }
 
-    private MxcStreamCloser? GetReadCloser(bool stdout)
+    private MxcStreamCloser? GetReadCloser(bool stdout) =>
+        WhenNotFinishing(() => GetReadCloserNow(stdout));
+
+    private MxcStreamCloser? GetReadCloserNow(bool stdout)
     {
-        lock (_controlLock)
+        var state = stdout ? _stdoutState : _stderrState;
+        var stream = stdout ? _stdout : _stderr;
+        if (state != ReadStreamState.CallerOwned)
         {
-            ThrowIfDisposed();
-            var state = stdout ? _stdoutState : _stderrState;
-            var stream = stdout ? _stdout : _stderr;
-            if (state != ReadStreamState.CallerOwned)
+            throw new InvalidOperationException(
+                "take the standard stream before requesting its closer");
+        }
+        if (stream is null)
+        {
+            return null;
+        }
+        unsafe
+        {
+            var closer = stdout
+                ? NativeMethods.mxc_sandbox_stdout_closer(_handle.Ptr)
+                : NativeMethods.mxc_sandbox_stderr_closer(_handle.Ptr);
+            return closer is null
+                ? null
+                : new MxcStreamCloser(MxcStreamCloserHandle.FromRaw(closer));
+        }
+    }
+
+    private T WhenNotFinishing<T>(Func<T> operation)
+    {
+        while (true)
+        {
+            Task finishing;
+            lock (_controlLock)
             {
-                throw new InvalidOperationException(
-                    "take the standard stream before requesting its closer");
+                ThrowIfDisposed();
+                if (!_isFinishing)
+                {
+                    return operation();
+                }
+                finishing = _finishing!;
             }
-            if (stream is null)
-            {
-                return null;
-            }
-            unsafe
-            {
-                var closer = stdout
-                    ? NativeMethods.mxc_sandbox_stdout_closer(_handle.Ptr)
-                    : NativeMethods.mxc_sandbox_stderr_closer(_handle.Ptr);
-                return closer is null
-                    ? null
-                    : new MxcStreamCloser(MxcStreamCloserHandle.FromRaw(closer));
-            }
+            ((IAsyncResult)finishing).AsyncWaitHandle.WaitOne();
         }
     }
 
@@ -413,6 +461,10 @@ public class MxcProcess : IMxcProcess
     /// by abandoning the wait (it does <b>not</b> kill the child — call
     /// <see cref="Kill"/> or <see cref="Dispose"/> for that).
     /// </summary>
+    /// <remarks>
+    /// Cancelling returns at once, even while the wait is finishing the
+    /// process's cleanup, which carries on for a later wait to return.
+    /// </remarks>
     public Task<WaitResult> WaitAsync(CancellationToken cancellationToken = default) =>
         Task.Run(() => WaitCore(cancellationToken), cancellationToken);
 
@@ -437,7 +489,16 @@ public class MxcProcess : IMxcProcess
     /// <exception cref="MxcException">The process status could not be queried.</exception>
     public bool TryGetExitCode(out int exitCode)
     {
-        return TryGetTerminalStatus(out exitCode, out _);
+        lock (_controlLock)
+        {
+            ThrowIfDisposed();
+            if (_isFinishing)
+            {
+                exitCode = _exitBeforeFinishing ?? 0;
+                return _exitBeforeFinishing.HasValue;
+            }
+            return TryGetTerminalStatus(out exitCode, out _);
+        }
     }
 
     private bool TryGetTerminalStatus(out int exitCode, out bool timedOut)
@@ -478,6 +539,14 @@ public class MxcProcess : IMxcProcess
             {
                 return;
             }
+        }
+        WhenNotFinishing(CloseUntakenStdinNow);
+    }
+
+    private bool CloseUntakenStdinNow()
+    {
+        if (!_stdinTaken)
+        {
             _stdinTaken = true;
             unsafe
             {
@@ -488,6 +557,7 @@ public class MxcProcess : IMxcProcess
                 }
             }
         }
+        return true;
     }
 
     private WaitResult WaitCore(CancellationToken cancellationToken)
@@ -503,13 +573,36 @@ public class MxcProcess : IMxcProcess
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (TryGetTerminalStatus(out _, out _))
+            if (PollForFinishing() is { } finishing)
             {
-                // try_wait is intentionally a non-blocking root-process poll.
-                // Complete the native wait so a cached timeout is translated
-                // into TimedOut and all backend finalization finishes before
-                // the managed Wait/WaitAsync contract returns.
-                return FinishExitedWait();
+                return finishing.WaitAsync(cancellationToken).GetAwaiter().GetResult();
+            }
+
+            cancellationToken.WaitHandle.WaitOne(poll);
+            var next = poll + poll;
+            poll = next > MaxPollInterval ? MaxPollInterval : next;
+        }
+    }
+
+    private Task<WaitResult>? PollForFinishing()
+    {
+        lock (_controlLock)
+        {
+            ThrowIfDisposed();
+
+            // A failed native wait is retried.
+            if (_finishing is { IsFaulted: false })
+            {
+                return _finishing;
+            }
+
+            // try_wait is intentionally a non-blocking root-process poll.
+            // Complete the native wait so a cached timeout is translated
+            // into TimedOut and all backend finalization finishes before
+            // the managed Wait/WaitAsync contract returns.
+            if (TryGetTerminalStatus(out var exitCode, out _))
+            {
+                return StartFinishing(exitCode, timedOut: false);
             }
 
             // On the spawn path try_wait reports only exited / still-running and
@@ -520,75 +613,76 @@ public class MxcProcess : IMxcProcess
             // mxc_sandbox_wait takes no deadline and applies the spawn-time
             // timeout as a duration from the call
             // (WaitForSingleObject(h, timeout_ms) on Windows, Instant::now() + d
-            // on Unix), so it would grant a second full budget — up to 2x the
-            // policy timeout, with _controlLock held the whole time.
+            // on Unix), so it would grant a second full budget, up to 2x the
+            // policy timeout. Killing the tree first lets the native wait reap
+            // an already-dead process.
             if (_timeoutMs is { } timeoutMs &&
                 Stopwatch.GetElapsedTime(_startTimestamp).TotalMilliseconds >= timeoutMs)
             {
-                return WaitAfterDeadline();
+                Kill();
+                return StartFinishing(exitCode: null, timedOut: true);
             }
 
-            cancellationToken.WaitHandle.WaitOne(poll);
-            var next = poll + poll;
-            poll = next > MaxPollInterval ? MaxPollInterval : next;
+            return null;
         }
     }
 
-    // The policy deadline has expired. Terminate the tree ourselves so the
-    // native wait reaps an already-dead process immediately instead of starting
-    // a fresh timeout_ms countdown, then report the timeout that the native call
-    // can no longer observe (it sees a killed process, not an expired budget).
-    private WaitResult WaitAfterDeadline()
+    // Runs without the control lock so Kill, Dispose, Warnings, and a
+    // cancelled WaitAsync do not wait for it.
+    private Task<WaitResult> StartFinishing(int? exitCode, bool timedOut)
     {
-        // A child that exited in the window between the poll above and here ran
-        // to completion, so surface its real status rather than a timeout.
-        if (TryGetTerminalStatus(out _, out _))
-        {
-            return FinishExitedWait();
-        }
-
-        // Safe to call after an exit that races this check: every backend
-        // no-ops a kill once the child has been reaped.
-        Kill();
-        var result = WaitBlocking();
-        return new WaitResult { ExitCode = result.ExitCode, TimedOut = true };
+        EnsureDrainUntaken();
+        _id ??= ReadId();
+        _exitBeforeFinishing = exitCode;
+        _warningsBeforeFinishing = ReadWarnings();
+        _isFinishing = true;
+        _finishing = Task.Factory.StartNew(
+            () => FinishWait(timedOut),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+        return _finishing;
     }
 
-    // Called only after try_wait reports exit or the managed deadline expired
-    // and the tree was killed. It holds the control lock across the native wait
-    // and must not be public: callers need Wait/WaitAsync so concurrent Kill and
-    // Dispose stay responsive.
-    private WaitResult FinishExitedWait()
+    private WaitResult FinishWait(bool timedOut)
     {
-        _finishingExitedWait = true;
+        int exit = 0;
+        int nativeTimedOut = 0;
+        int status;
         try
         {
-            return WaitBlocking();
+            unsafe
+            {
+                status = NativeMethods.mxc_sandbox_wait(_handle.Ptr, &exit, &nativeTimedOut);
+            }
         }
         finally
         {
-            _finishingExitedWait = false;
+            EndFinishing();
         }
+        if (status != (int)ErrorCode.Success)
+        {
+            throw new MxcException((ErrorCode)status, "waiting on the sandbox failed");
+        }
+        return new WaitResult { ExitCode = exit, TimedOut = timedOut || nativeTimedOut != 0 };
     }
 
-    private WaitResult WaitBlocking()
+    // A Dispose during the native wait leaves the release to here, before any
+    // wait sees the result.
+    private void EndFinishing()
     {
-        EnsureDrainUntaken();
+        List<Task>? drains = null;
         lock (_controlLock)
         {
-            ThrowIfDisposed();
-            int exit = 0;
-            int timedOut = 0;
-            int status;
-            unsafe
+            _isFinishing = false;
+            if (_disposed)
             {
-                status = NativeMethods.mxc_sandbox_wait(_handle.Ptr, &exit, &timedOut);
+                drains = new List<Task>(_drainTasks);
             }
-            if (status != (int)ErrorCode.Success)
-            {
-                throw new MxcException((ErrorCode)status, "waiting on the sandbox failed");
-            }
-            return new WaitResult { ExitCode = exit, TimedOut = timedOut != 0 };
+        }
+        if (drains is not null)
+        {
+            ReleaseNative(drains);
         }
     }
 
@@ -707,22 +801,21 @@ public class MxcProcess : IMxcProcess
     /// <summary>Kill the child and its whole process tree.</summary>
     /// <remarks>
     /// Returns at once without killing anything if a wait has already seen the
-    /// process exit and is finishing its cleanup; that wait completes the
-    /// teardown.
+    /// process exit, or killed it at its timeout, and is finishing its cleanup;
+    /// that wait completes the teardown.
     /// </remarks>
     /// <exception cref="MxcException">The kill failed.</exception>
     public void Kill()
     {
-        // Every backend ignores a kill once the process has exited, so do not
-        // queue behind a wait that is already finishing.
-        if (_finishingExitedWait)
-        {
-            ThrowIfDisposed();
-            return;
-        }
         lock (_controlLock)
         {
             ThrowIfDisposed();
+
+            // Every backend ignores a kill once the process has exited.
+            if (_isFinishing)
+            {
+                return;
+            }
             int status;
             unsafe
             {
@@ -736,24 +829,24 @@ public class MxcProcess : IMxcProcess
     }
 
     /// <summary>Resize a process attached to an MXC-owned pseudo-terminal.</summary>
-    protected void ResizePty(MxcPtySize size)
+    protected void ResizePty(MxcPtySize size) =>
+        WhenNotFinishing(() => ResizePtyNow(size));
+
+    private bool ResizePtyNow(MxcPtySize size)
     {
-        lock (_controlLock)
+        int status;
+        unsafe
         {
-            ThrowIfDisposed();
-            int status;
-            unsafe
-            {
-                status = NativeMethods.mxc_sandbox_pty_resize(
-                    _handle.Ptr,
-                    size.Rows,
-                    size.Columns);
-            }
-            if (status != (int)ErrorCode.Success)
-            {
-                throw new MxcException((ErrorCode)status, "resizing sandbox PTY failed");
-            }
+            status = NativeMethods.mxc_sandbox_pty_resize(
+                _handle.Ptr,
+                size.Rows,
+                size.Columns);
         }
+        if (status != (int)ErrorCode.Success)
+        {
+            throw new MxcException((ErrorCode)status, "resizing sandbox PTY failed");
+        }
+        return true;
     }
 
     // Start background readers that drain any standard stream the caller did not
@@ -814,6 +907,10 @@ public class MxcProcess : IMxcProcess
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// If a wait is finishing the process's cleanup, this returns at once and
+    /// that wait releases the native handles before it returns.
+    /// </remarks>
     public void Dispose()
     {
         List<Task> drains;
@@ -824,15 +921,22 @@ public class MxcProcess : IMxcProcess
                 return;
             }
             _disposed = true;
+            if (_isFinishing)
+            {
+                return;
+            }
             // Snapshot the drain tasks under the lock; no new ones start once
             // _disposed is set (EnsureDrainUntaken throws).
             drains = new List<Task>(_drainTasks);
         }
+        ReleaseNative(drains);
+    }
 
+    private void ReleaseNative(List<Task> drains)
+    {
         // Free the sandbox handle first: mxc_sandbox_free kills the child tree,
         // closing the child's stdout/stderr write ends so any blocked reader or
-        // drain task gets EOF and unblocks. (No control op can be running: they
-        // hold _controlLock, which we just took to set _disposed.)
+        // drain task gets EOF and unblocks.
         _handle.Dispose();
 
         // Now the drain/read tasks observe EOF and finish; wait for them before

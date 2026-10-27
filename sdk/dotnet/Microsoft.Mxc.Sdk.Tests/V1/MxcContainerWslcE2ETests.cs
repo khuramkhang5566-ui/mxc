@@ -158,6 +158,66 @@ public class MxcContainerWslcE2ETests
         stdin.Dispose();
     }
 
+    // Unread stdin makes the WSLc SDK report this command's exit about 50 seconds late.
+    private static async Task<(MxcProcess Process, Stream Stdin)> SpawnCommandWithLateExitAsync()
+    {
+        var proc = MxcContainer.SpawnWithStdin(Request("sh -c 'sleep 2; head -c 1 >/dev/null'"));
+        var stdin = proc.StandardInput;
+        Assert.NotNull(stdin);
+        var flood = stdin.WriteAsync(new byte[4 * 1024 * 1024], TestContext.Current.CancellationToken).AsTask();
+        await AssertFinishesWithinAsync(flood, TimeSpan.FromSeconds(30), "the command's exit did not release the write");
+        while (!proc.TryGetExitCode(out _))
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(100), TestContext.Current.CancellationToken);
+        }
+        return (proc, stdin);
+    }
+
+    [Fact]
+    public async Task SpawnWithStdin_CancellingAWaitDoesNotWaitForTheCleanupOfAnExitedCommand()
+    {
+        RequireWslc();
+
+        var late = await SpawnCommandWithLateExitAsync();
+        using var proc = late.Process;
+        var stdin = late.Stdin;
+        using var cancel = new CancellationTokenSource();
+        var cancelled = proc.WaitAsync(cancel.Token);
+        await Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+        Assert.False(cancelled.IsCompleted, "the SDK reported the exit on time, so there was no cleanup to wait for");
+
+        cancel.Cancel();
+
+        await AssertFinishesWithinAsync(cancelled, TimeSpan.FromSeconds(5), "the cancelled wait waited for the cleanup");
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelled);
+        var wait = proc.WaitAsync(TestContext.Current.CancellationToken);
+        await AssertFinishesWithinAsync(wait, TimeSpan.FromSeconds(150), "the command never finished");
+        Assert.False((await wait).TimedOut);
+        stdin.Dispose();
+    }
+
+    [Fact]
+    public async Task SpawnWithStdin_WarningsAndDisposeDoNotWaitForTheCleanupOfAnExitedCommand()
+    {
+        RequireWslc();
+
+        var (proc, stdin) = await SpawnCommandWithLateExitAsync();
+        var wait = proc.WaitAsync(TestContext.Current.CancellationToken);
+        await Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+        Assert.False(wait.IsCompleted, "the SDK reported the exit on time, so there was no cleanup to wait for");
+
+        await AssertFinishesWithinAsync(Task.Run(() => proc.Warnings, TestContext.Current.CancellationToken), TimeSpan.FromSeconds(5), "Warnings waited for the cleanup");
+        await AssertFinishesWithinAsync(Task.Run(proc.Dispose, TestContext.Current.CancellationToken), TimeSpan.FromSeconds(5), "Dispose waited for the cleanup");
+        await AssertFinishesWithinAsync(wait, TimeSpan.FromSeconds(150), "the command never finished");
+        Assert.False((await wait).TimedOut);
+        Assert.Throws<ObjectDisposedException>(() => proc.Warnings);
+        stdin.Dispose();
+        var next = await MxcContainer.RunAsync(
+            Request("true"),
+            cancellationToken: TestContext.Current.CancellationToken);
+        Assert.True(next.ExitCode == 0, "the disposed process did not release its session before its wait returned");
+    }
+
     [Fact]
     public async Task SpawnWithStdin_KillReleasesAWriteBlockedOnStdin()
     {
