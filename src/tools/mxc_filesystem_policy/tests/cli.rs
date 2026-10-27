@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -53,6 +53,10 @@ fn exports_a_fragment_without_mixing_diagnostics_into_json() -> Result<()> {
         })
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("not explicit MXC denies"));
+    assert!(
+        !output.stderr.contains(&b'\r'),
+        "auto progress must be hidden on redirected stderr"
+    );
     Ok(())
 }
 
@@ -169,5 +173,115 @@ fn partial_fragments_require_and_preserve_an_explicit_coverage_report() -> Resul
     assert_eq!(coverage["unknownPaths"][0]["path"], "C:\\Data\\Private");
     assert_eq!(coverage["unknownPaths"][0]["scope"], "subtree");
     assert!(String::from_utf8_lossy(&partial.stderr).contains("PARTIAL"));
+    Ok(())
+}
+
+#[test]
+fn progress_modes_preserve_json_and_finish_before_diagnostics() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("inventory.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&inventory("ALL_APPLICATION_PACKAGES", 0))?,
+    )?;
+    let mut baseline = None;
+    for mode in ["never", "always"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_mxc-filesystem-policy"))
+            .arg("--inventory")
+            .arg(&input)
+            .args(["--progress", mode])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let fragment: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(
+            fragment["filesystem"]["deniedPaths"],
+            json!(["C:\\Data\\Private"])
+        );
+        if let Some(expected) = &baseline {
+            assert_eq!(&output.stdout, expected);
+        } else {
+            baseline = Some(output.stdout.clone());
+        }
+        let stderr = String::from_utf8(output.stderr)?;
+        if mode == "always" {
+            assert!(stderr.contains("\r["));
+            assert!(stderr.contains("2 paths"));
+            let summary = stderr
+                .find("Inventoried")
+                .ok_or_else(|| anyhow::anyhow!("missing completion summary"))?;
+            assert!(stderr[..summary].ends_with('\r'));
+            assert!(!stderr[summary..].contains('\r'));
+        } else {
+            assert!(!stderr.contains('\r'));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn progress_is_cleared_before_reporting_generation_errors() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("inventory.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&inventory("ALL_APPLICATION_PACKAGES", 2))?,
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_mxc-filesystem-policy"))
+        .arg("--inventory")
+        .arg(&input)
+        .args(["--progress", "always"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr)?;
+    let error = stderr
+        .find("mxc-filesystem-policy:")
+        .ok_or_else(|| anyhow::anyhow!("missing generation error"))?;
+    assert!(stderr[..error].contains("\r["));
+    assert!(stderr[..error].ends_with('\r'));
+    assert!(!stderr[error..].contains('\r'));
+    Ok(())
+}
+
+#[test]
+fn shared_console_progress_is_cleared_before_any_json_is_written() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("inventory.json");
+    let console = directory.path().join("console.log");
+    fs::write(
+        &input,
+        serde_json::to_vec(&inventory("ALL_APPLICATION_PACKAGES", 0))?,
+    )?;
+    let writer = fs::File::create(&console)?;
+    let status = Command::new(env!("CARGO_BIN_EXE_mxc-filesystem-policy"))
+        .arg("--inventory")
+        .arg(input)
+        .args(["--progress", "always"])
+        .stdout(Stdio::from(writer.try_clone()?))
+        .stderr(Stdio::from(writer))
+        .status()?;
+    assert!(status.success());
+    let text = fs::read_to_string(console)?;
+    let start = text
+        .find("{\n")
+        .ok_or_else(|| anyhow::anyhow!("missing JSON output"))?;
+    let summary = text[start..]
+        .find("\nInventoried")
+        .map(|offset| start + offset)
+        .ok_or_else(|| anyhow::anyhow!("missing completion summary"))?;
+    assert!(text[..start].contains("\r["));
+    assert!(
+        !text[start..].contains('\r'),
+        "progress cleanup overwrote part of the JSON"
+    );
+    let fragment: Value = serde_json::from_str(text[start..summary].trim())?;
+    assert_eq!(
+        fragment["filesystem"]["deniedPaths"],
+        json!(["C:\\Data\\Private"])
+    );
     Ok(())
 }

@@ -4,6 +4,7 @@
 //! Generate a documentation fragment for application-package filesystem access.
 
 mod model;
+mod progress;
 #[cfg(target_os = "windows")]
 mod windows_scan;
 
@@ -15,6 +16,7 @@ use std::process::ExitCode;
 use anyhow::{ensure, Context, Result};
 use clap::{ArgGroup, Parser};
 use model::{generate, Inventory, Principal, ScanMode};
+use progress::{Progress, ProgressMode};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,16 +53,24 @@ struct Cli {
     /// Coverage report qualifying unknown paths in the partial fragment.
     #[arg(long, requires = "best_effort", value_name = "FILE")]
     report: Option<PathBuf>,
+    /// Show progress on stderr: auto hides it when stderr is redirected.
+    #[arg(long, value_enum, default_value = "auto")]
+    progress: ProgressMode,
 }
 
-fn scan(paths: &[PathBuf], principal: Principal, mode: ScanMode) -> Result<Inventory> {
+fn scan(
+    paths: &[PathBuf],
+    principal: Principal,
+    mode: ScanMode,
+    progress: &mut Progress,
+) -> Result<Inventory> {
     #[cfg(target_os = "windows")]
     {
-        windows_scan::scan(paths, principal, mode)
+        windows_scan::scan(paths, principal, mode, |state| progress.update(state))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (paths, principal, mode);
+        let _ = (paths, principal, mode, progress);
         anyhow::bail!(
             "live ACL collection requires Windows; use --inventory for offline generation"
         )
@@ -112,7 +122,7 @@ fn location_key(path: &Path) -> Result<String> {
     })
 }
 
-fn run(args: Cli) -> Result<()> {
+fn run(args: Cli, progress: &mut Progress) -> Result<()> {
     let mut locations = Vec::new();
     for path in [
         &args.out,
@@ -139,6 +149,7 @@ fn run(args: Cli) -> Result<()> {
     };
     let inventory = match &args.inventory {
         Some(path) => {
+            progress.phase("Reading inventory", Some(path))?;
             let bytes =
                 fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
             let inventory: Inventory = serde_json::from_slice(&bytes)
@@ -151,28 +162,56 @@ fn run(args: Cli) -> Result<()> {
             }
             inventory
         }
-        None => scan(&args.path, args.principal.unwrap_or_default(), mode)?,
+        None => {
+            progress.phase("Scanning", args.path.first().map(PathBuf::as_path))?;
+            scan(
+                &args.path,
+                args.principal.unwrap_or_default(),
+                mode,
+                progress,
+            )?
+        }
     };
+    progress.counts(
+        inventory.directories.len(),
+        inventory
+            .directories
+            .iter()
+            .filter(|node| node.unknown_reason.is_some())
+            .count(),
+    );
     if let Some(path) = &args.save_inventory {
+        progress.phase("Saving inventory", Some(path))?;
         let mut bytes = serde_json::to_vec_pretty(&inventory)?;
         bytes.push(b'\n');
         write_file(path, &bytes)?;
     }
+    progress.phase("Generating fragment", None)?;
     let generated = generate(&inventory, mode)?;
+    progress.counts(
+        inventory.directories.len(),
+        generated.coverage.unknown_paths.len(),
+    );
     let mut content = serde_json::to_vec_pretty(&generated.fragment)?;
     content.push(b'\n');
     if let Some(path) = &args.report {
+        progress.phase("Writing coverage", Some(path))?;
         let mut bytes = serde_json::to_vec_pretty(&generated.coverage)?;
         bytes.push(b'\n');
         write_file(path, &bytes)?;
     }
+    progress.phase("Writing fragment", args.out.as_deref())?;
     match &args.out {
         Some(path) => write_file(path, &content)?,
-        None => io::stdout()
-            .lock()
-            .write_all(&content)
-            .context("cannot write fragment to stdout")?,
+        None => {
+            progress.finish()?;
+            io::stdout()
+                .lock()
+                .write_all(&content)
+                .context("cannot write fragment to stdout")?;
+        }
     }
+    progress.finish()?;
     eprintln!(
         "Inventoried {} directory paths for {}: {} read-only grants, {} read-write grants, {} baseline exceptions.",
         inventory.directories.len(),
@@ -196,11 +235,16 @@ fn run(args: Cli) -> Result<()> {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
+    let args = Cli::parse();
+    let mut progress = Progress::new(args.progress);
+    let result = run(args, &mut progress);
+    let cleanup = progress.finish();
+    let mut status = ExitCode::SUCCESS;
+    for result in [result, cleanup] {
+        if let Err(error) = result {
             eprintln!("mxc-filesystem-policy: {error:#}");
-            ExitCode::FAILURE
+            status = ExitCode::FAILURE;
         }
     }
+    status
 }

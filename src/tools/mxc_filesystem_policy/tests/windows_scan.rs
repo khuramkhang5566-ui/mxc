@@ -109,11 +109,18 @@ fn native_collection_compacts_grants_and_preserves_empty_and_nested_exceptions()
         .arg(directory.path())
         .arg("--save-inventory")
         .arg(&snapshot)
+        .args(["--progress", "always"])
         .output()?;
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .split('\r')
+            .any(|line| line.contains("Scanning") && line.contains("6 paths")),
+        "live collection did not report its final scanned-path count"
     );
     let fragment: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(

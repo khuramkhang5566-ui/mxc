@@ -25,6 +25,7 @@ use windows::Win32::Security::{
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
 
 use crate::model::{Directory, Inventory, Principal, Rights, ScanMode};
+use crate::progress::ScanProgress;
 
 struct LocalAllocation(*mut c_void);
 
@@ -192,7 +193,12 @@ fn read_children(path: &Path, mode: ScanMode) -> Result<Vec<(PathBuf, bool)>> {
     Ok(children)
 }
 
-pub(crate) fn scan(paths: &[PathBuf], principal: Principal, mode: ScanMode) -> Result<Inventory> {
+pub(crate) fn scan(
+    paths: &[PathBuf],
+    principal: Principal,
+    mode: ScanMode,
+    mut on_progress: impl FnMut(ScanProgress<'_>) -> Result<()>,
+) -> Result<Inventory> {
     ensure!(!paths.is_empty(), "at least one scan root is required");
     let selected = SelectedSid::new(principal)?;
     let mut roots = Vec::new();
@@ -223,7 +229,14 @@ pub(crate) fn scan(paths: &[PathBuf], principal: Principal, mode: ScanMode) -> R
         principal,
         directories: Vec::new(),
     };
+    let mut unknown = 0;
     while let Some((path, parent, reparse)) = pending.pop() {
+        on_progress(ScanProgress {
+            current: Some(&path),
+            scanned: inventory.directories.len(),
+            unknown,
+            pending: pending.len(),
+        })?;
         let collected = if reparse {
             Err(anyhow::anyhow!("directory reparse point was not followed"))
         } else {
@@ -241,6 +254,7 @@ pub(crate) fn scan(paths: &[PathBuf], principal: Principal, mode: ScanMode) -> R
                     denied_mask: 0,
                     unknown_reason: Some(format!("{error:#}")),
                 });
+                unknown += 1;
                 continue;
             }
             Err(error) => return Err(error),
@@ -261,5 +275,11 @@ pub(crate) fn scan(paths: &[PathBuf], principal: Principal, mode: ScanMode) -> R
                 .map(|(child, reparse)| (child, Some(index), reparse)),
         );
     }
+    on_progress(ScanProgress {
+        current: None,
+        scanned: inventory.directories.len(),
+        unknown,
+        pending: 0,
+    })?;
     Ok(inventory)
 }

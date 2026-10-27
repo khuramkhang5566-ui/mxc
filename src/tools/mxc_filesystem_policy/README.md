@@ -32,6 +32,17 @@ Fragment files are replaced only after collection, classification, and
 verification succeed. Only the supplied roots are covered; paths outside them
 are not classified.
 
+When stderr is a terminal, an in-place progress display shows elapsed time,
+directory paths processed, unknown paths encountered, queued directories, and
+the current path. It uses an activity bar rather than a percentage because the
+total directory count is not known in advance. Updates are throttled to ten per
+second; inventory loading, generation, and writing also show their current phase.
+
+Progress never goes to stdout and is hidden when stderr is redirected.
+Use `--progress never` to disable it, or `--progress always` to force it when
+capturing stderr. Forced output without terminal dimensions uses an 80-column
+layout. The display is cleared before completion summaries or errors.
+
 For the restricted application-package group:
 
 ```powershell
@@ -145,7 +156,8 @@ The generator validates the tree and replays its compact rules against every
 inventoried directory before emitting output. Lists are sorted by path.
 `serde`/`serde_json` provide the inventory and fragment formats, `clap` provides
 the CLI, `windows` supplies the native collection APIs, and `tempfile` provides
-atomic output replacement.
+atomic output replacement. On Unix, `libc` supplies terminal dimensions for
+offline replay progress.
 
 ## Checks
 
