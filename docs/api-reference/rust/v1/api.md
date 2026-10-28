@@ -56,6 +56,13 @@ pub fn available_backends() -> Vec<AvailableBackend>;
 
 Discover tool and SDK directories from environment (defaults to the process environment) as read-only policy paths.
 
+On Windows, finding `pwsh.exe` on `PATH` also grants read-write access to the
+PSReadLine history directory under the supplied `USERPROFILE`. It does not
+implicitly grant read access to a drive root.
+
+For PowerShell startup failures, see
+[troubleshooting](https://github.com/microsoft/mxc/blob/main/docs/troubleshooting.md#powershell-startup).
+
 ```rust
 pub fn available_tools_policy(environment: Option<&[(String, String)]>, options: ToolsPolicyOptions) -> FilesystemPolicyResult;
 ```

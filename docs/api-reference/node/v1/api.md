@@ -54,6 +54,13 @@ export async function deprovisionContainer<C extends LifecycleContainmentKind>(c
 
 Discover tool and SDK directories from the environment and return them as policy paths.
 
+On Windows, finding `pwsh.exe` on `PATH` also grants read-write access to the
+PSReadLine history directory under the supplied `USERPROFILE`. It does not
+implicitly grant read access to a drive root.
+
+For PowerShell startup failures, see
+[troubleshooting](https://github.com/microsoft/mxc/blob/main/docs/troubleshooting.md#powershell-startup).
+
 ```typescript
 export function getAvailableToolsPolicy(environment?: {
   [key: string]: string | undefined;

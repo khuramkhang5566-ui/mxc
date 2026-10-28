@@ -40,7 +40,9 @@ use crate::bwrap_common::{
     bwrap_command::{self, ResolvedNetworkMode},
     bwrap_version, network_rules,
     provider_monitor::ProviderMonitor,
-    proxy_network, seccomp_filter,
+    proxy_network,
+    resolver_file::ResolverFile,
+    seccomp_filter,
 };
 
 const DNS_PORT: u16 = 53;
@@ -407,8 +409,8 @@ fn warn_resolver_mount_hint_with(
     logger.warning_line(&format!(
         "WARNING: Bubblewrap: /etc/resolv.conf points to {target_str:?}, but no known \
          mount destination overlaps that path. DNS may fail if the link does not \
-         resolve inside the sandbox; check the link and consider listing its \
-         containing directory in filesystem.readonlyPaths."
+         resolve inside the sandbox; check the link and consider listing the \
+         resolver file in filesystem.readonlyPaths."
     ));
 }
 
@@ -449,6 +451,14 @@ impl BubblewrapScriptRunner {
         }
 
         let network_mode = ResolvedNetworkMode::from_request(request, configured_proxy.is_some());
+        let resolver_file = ResolverFile::for_host(&request.policy, logger);
+        let mut mounts = bwrap_command::policy_mounts(&request.policy);
+        let resolver_args = match &resolver_file {
+            Some(resolver) => resolver
+                .mount_args(&mut mounts, denied_files)
+                .map_err(|error| ScriptResponse::error(&format!("Bubblewrap: {error}")))?,
+            None => Vec::new(),
+        };
         let sandbox_proxy = if network_mode == ResolvedNetworkMode::ProxyOnly {
             let address = configured_proxy.ok_or_else(|| {
                 ScriptResponse::error(
@@ -501,7 +511,8 @@ impl BubblewrapScriptRunner {
                         Err(error) => return Err(ScriptResponse::error(&error)),
                     },
                 };
-                let resolver = proxy_network::ResolverPin::for_host(&request.policy, logger);
+                let resolver =
+                    proxy_network::ResolverPin::for_host(&request.policy, &mounts, logger);
                 match proxy_network::ProxyNetworkNamespace::start(
                     &plan,
                     &network_rules::IngressPlan::for_policy(&request.policy),
@@ -533,6 +544,8 @@ impl BubblewrapScriptRunner {
             denied_files,
             network_mode,
             Some(seccomp_filter.as_raw_fd()),
+            &resolver_args,
+            &mounts,
         );
 
         if stdio == StdioMode::Inherit {
@@ -610,7 +623,11 @@ impl BubblewrapScriptRunner {
         if let Some(startup) = network_startup.as_ref() {
             startup.prepare_command(&mut command);
         }
-        proxy_network::inherit_descriptors(&mut command, vec![seccomp_filter.as_raw_fd()]);
+        let mut descriptors = vec![seccomp_filter.as_raw_fd()];
+        if let Some(fd) = resolver_file.as_ref().and_then(ResolverFile::snapshot_fd) {
+            descriptors.push(fd);
+        }
+        proxy_network::inherit_descriptors(&mut command, descriptors);
 
         let mut child = match command.spawn() {
             Ok(process) => process,
@@ -736,7 +753,6 @@ impl BwrapChild {
         self.child.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Tear down per-run private network state.
     fn cleanup(&mut self, logger: &mut Logger) {
         // Stopping the supervisor closes the descriptor the monitor watches, so
         // disarming first is what keeps a normal teardown from reading as a

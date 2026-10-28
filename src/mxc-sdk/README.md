@@ -186,7 +186,22 @@ the configured diagnostic sink. `user_profile_policy` discovers standard
 per-user tool locations, and `temporary_files_policy` returns existing
 temporary storage without creating directories.
 
+On Windows, finding `pwsh.exe` on `PATH` adds the PSReadLine history directory
+as read-write. Discovery does not implicitly grant read access to a drive root.
+
+For PowerShell startup failures, see
+[troubleshooting](https://github.com/microsoft/mxc/blob/main/docs/troubleshooting.md#powershell-startup).
+
 ## Internal modules and executor binaries
+
+### Experimental MicroVM support
+
+Enable the `microvm` Cargo feature to build experimental MicroVM support on
+Windows x64. Execution also requires runtime experimental opt-in. This phase
+supports development JSON create-and-run requests, not MicroVM targeting through
+the typed V1 SDK APIs, streaming, PTY, or container lifecycle operations. See the
+[NVX backend guide](https://github.com/microsoft/mxc/blob/main/docs/backends/nvx/nvx.md)
+for prerequisites and usage.
 
 Backend implementations, shared runtime support, backend dispatch, and host
 probing are internal modules of this published crate. The crate root exposes
