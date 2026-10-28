@@ -78,6 +78,18 @@ temp report afterward.
 - With `deniedResourcesTruncated: false`, zero denials still doesn't prove the
   policy grants everything the workload needs. See **Not covered** above.
 
+**Output files:**
+
+| File | Purpose | Contents |
+|---|---|---|
+| Report, `denials.<pid>_<id>.json` | What to change in the policy | One entry per unique denial, in the [Windows format](../../../../logging-access-denied.md#output-file-the-caller-consumes): resource, type, access, pid, and time. Full paths. |
+| Verbose report, `.verbose.json` | Why the report looks the way it does | Every tagged log event, grouped by operation, process, decision, and target, with counts. Also includes events left out of the report: such as known noise from `/dev/dtracehelper` and events MXC couldn't parse. Shows completeness flags such as `processedEventsTruncated`. Paths are replaced with `<REDACTED>`. |
+| Trace, `.seatbelt.log` (only with `retainEtl`) | Debugging MXC itself | The raw `log stream` lines for this run, before MXC processes them. |
+
+MXC writes the report and verbose report together; if either write fails,
+neither file is kept. Output metadata reports only the report path. The
+verbose path comes from the report name.
+
 **Collection limits:**
 
 | Limit | Value |
