@@ -225,8 +225,21 @@ get fixed or wired.
 | WSLC | ✅ Good | Might have to retry hung jobs - this is an issue with overzealous agent reclaiming. |
 | IsolationSession | ✅ Good | Runs the one-shot and state-aware suites, the Rust SDK in-process and helper tests, the C# end-to-end tests, the Node SDK suite and the COM apartment probe. Fails when the host cannot run isolation sessions, when a suite executes nothing, or when the run changes the set of local accounts. |
 | Windows Sandbox | ⛔ Blocked | Images don't support `Containers-DisposableClientVM` opt. feature |
-| MicroVM | Experimental | Windows 25H2 x64 nightly runs the prebuilt `mxc-sdk/tests/nvx_e2e.rs` suite, including executor config scenarios, captured JSON execution, and real console interruption during startup and execution with VM/state cleanup assertions. Host-only and extracted-crate compilation checks remain in normal Windows x64 PR builds. |
+| MicroVM | Experimental | Windows 25H2 x64 nightly; see [MicroVM validation](#microvm-validation). |
 | Seatbelt | ✅ Good | Failures are genuine MXC bugs. |
+
+### MicroVM validation
+
+The nightly job runs the prebuilt `mxc-sdk/tests/nvx_e2e.rs` suite, including
+executor configurations, captured JSON execution, image selection, filesystem
+restrictions, network allow/deny and port matching, and blocked direct egress
+alongside successful proxy traffic. It tests console interruption during
+startup and execution, with VM and state cleanup assertions.
+
+Network scenarios use host-controlled endpoints with positive reachability
+controls before and after restrictions. The host needs a non-loopback IPv4
+route outside the fixed `10.0.0.0/24` guest network. Host-only and
+extracted-crate compilation checks remain in normal Windows x64 PR builds.
 
 ### ProcessContainer SDK streaming
 

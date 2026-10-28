@@ -13,6 +13,10 @@ versioning, repository-consistency, and SDK jobs. Repository consistency also
 checks that `mxc-sdk` is the only Rust release crate and has a valid package
 name, version, description, repository, and license.
 
+The .NET API parity gate compares lifecycle ID prefixes for backends supported
+by the engine's lifecycle dispatcher. Prefixes recognized only to reject an
+unsupported lifecycle operation do not require a published .NET SDK variant.
+
 Windows builds first run host-only regression checks for loopback command
 quoting and native-process output capture. These verify direct and
 shell-wrapped launches, normal stdout/stderr capture, and prompt failure when
