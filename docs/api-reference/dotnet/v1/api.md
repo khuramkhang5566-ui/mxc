@@ -27,6 +27,9 @@ is no separate public attached-console launch API. Typed V1 does not accept
 [V1.Dev exact-JSON API](https://github.com/microsoft/mxc/blob/main/docs/api-reference/dotnet/v1/dev.md)
 accepts caller-authored requests separately.
 
+Captured existing-container execution closes its output readers on timeout
+and returns the text collected so far with `TimedOut = true`.
+
 Read the terminal output concurrently rather than only after waiting. On macOS
 a workload cannot exit while its terminal output is still unread, so a caller
 that waits first without reading can block indefinitely.
