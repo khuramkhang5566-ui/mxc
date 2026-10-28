@@ -172,6 +172,28 @@ jobs:
           cargo test --locked --release --target "${{ matrix.target }}" -p mxc-sdk -p mxc_ffi --lib state_aware
           cargo test --locked --release --target "${{ matrix.target }}" -p mxc-sdk --test state_aware
 
+      - name: Test native module lifetime
+        working-directory: src
+        run: |
+          cargo build --locked --release --target "${{ matrix.target }}" -p mxc-sdk --example module_lifetime_fixture
+          cargo test --locked --release --target "${{ matrix.target }}" -p mxc-sdk --test module_lifetime
+
+      - name: Test and stage filesystem probe request deadlines
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="$(cargo test --locked --release --target "${{ matrix.target }}" \
+            -p mxc-sdk --lib --no-run --message-format=json |
+            python3 -c 'import json,sys; items=[json.loads(line) for line in sys.stdin]; paths=[m["executable"] for m in items if m.get("reason")=="compiler-artifact" and m["target"]["name"]=="mxc_sdk" and m["profile"]["test"] and m.get("executable")]; assert len(paths)==1, paths; print(paths[0])')"
+          destination="target/${{ matrix.target }}/release/mxc-filesystem-probe-tests"
+          cp "$payload" "$destination"
+          for backend in bubblewrap lxc; do
+            test_name="core_modules::mxc_common::filesystem_probe::launch_tests::scenarios::${backend}_launch_rejects_stalled_paths"
+            "$destination" --list --ignored --exact "$test_name" | grep -Fx "$test_name: test"
+          done
+          "$destination" --ignored filesystem_probe::launch_tests::
+
       # This lane selects lib tests by module, so mxc_pty needs an explicit
       # step; the macOS lane picks it up via the package-wide run. The tests
       # drive /dev/ptmx directly and need no sandbox backend installed.
@@ -262,5 +284,6 @@ jobs:
             src/target/${{ matrix.target }}/release/lxc-exec
             src/target/${{ matrix.target }}/release/unix-test-proxy
             src/target/${{ matrix.target }}/release/libmxc_ffi.so
+            src/target/${{ matrix.target }}/release/mxc-filesystem-probe-tests
           if-no-files-found: error
           retention-days: 1

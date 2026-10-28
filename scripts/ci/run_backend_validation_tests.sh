@@ -21,6 +21,15 @@ repo_root="$(cd "$script_root/../.." && pwd)"
 test_script_root="$repo_root/tests/scripts"
 release_directory="$repo_root/src/target/release"
 
+run_filesystem_probe_tests() {
+    local executable="$binary_directory/mxc-filesystem-probe-tests"
+    local test_name="core_modules::mxc_common::filesystem_probe::launch_tests::scenarios::${backend}_launch_rejects_stalled_paths"
+    test -f "$executable"
+    chmod +x "$executable"
+    "$executable" --list --ignored --exact "$test_name" | grep -Fx "$test_name: test"
+    "$executable" --ignored --exact "$test_name"
+}
+
 case "$backend" in
     microvm)
         # Keep unwired commands explicit so accidental activation fails loudly.
@@ -29,6 +38,7 @@ case "$backend" in
         exit 2
         ;;
     bubblewrap)
+        run_filesystem_probe_tests
         # Existing Linux shell tests locate binaries under src/target/release.
         test -x "$binary_directory/lxc-exec"
         test -f "$binary_directory/unix-test-proxy"
@@ -64,6 +74,7 @@ case "$backend" in
         exit "$inbound_status"
         ;;
     lxc)
+        run_filesystem_probe_tests
         test -x "$binary_directory/lxc-exec"
         test -f "$binary_directory/unix-test-proxy"
         mkdir -p "$release_directory"

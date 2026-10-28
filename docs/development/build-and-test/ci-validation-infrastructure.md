@@ -172,6 +172,14 @@ Node create-and-run and lifecycle suites from the SDK bundle. The SDK suites ski
 no tests is reported as a failure, so a WSLC host can never pass on skipped SDK
 tests.
 
+Bubblewrap, LXC, and WSLC also run the prebuilt
+`mxc-filesystem-probe-tests` executable from their build artifact. These public
+SDK regressions block each policy probe in a subprocess, require a bounded
+path-specific rejection, and check that no workload ran; WSLC also covers
+container provisioning. The blocked-call hook is test-only. See
+[filesystem probe request deadlines](pull-requests.md#filesystem-probe-request-deadlines)
+for local commands and watchdog behavior.
+
 An unwired backend fails loudly on purpose: adding it to a trigger produces a
 red job ("write the tests or remove it"), never a green no-op. The dispatchers'
 accepted-id lists (`ValidateSet` on Windows, the `case` arms on Unix) are what

@@ -336,6 +336,14 @@ test("npm pack excludes NVX runtime and validation payloads without removing sup
   const artifactSuite = join(result.outputDirectory, result.triplet, "nvx-e2e-tests.exe");
   writeFileSync(artifactSuite, validationSuite);
   writeFileSync(join(x64, "nvx-e2e-tests.exe"), validationSuite);
+  const probeSuites = ["x64", "arm64"].flatMap((arch) =>
+    ["mxc-filesystem-probe-tests", "mxc-filesystem-probe-tests.exe"].map((name) => ({ arch, name }))
+  );
+  for (const { arch, name } of probeSuites) {
+    const directory = join(binaryRoot, arch);
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, name), validationSuite);
+  }
   const script = join(result.directory, "npm-artifact.ps1");
   const quote = (path) => `'${path.replaceAll("'", "''")}'`;
   writeFileSync(script, [
@@ -359,6 +367,9 @@ test("npm pack excludes NVX runtime and validation payloads without removing sup
   assert.deepEqual(fileDigests(join(result.outputDirectory, result.triplet, "aci-edge-sandboxes")), expected);
   assert.deepEqual(readFileSync(artifactSuite), validationSuite);
   assert.deepEqual(readFileSync(join(x64, "nvx-e2e-tests.exe")), validationSuite);
+  for (const { arch, name } of probeSuites) {
+    assert.deepEqual(readFileSync(join(binaryRoot, arch, name)), validationSuite);
+  }
 
   rmSync(join(binaryRoot, ".npmignore"));
   const unfiltered = spawnSync("npm pack --ignore-scripts --offline --json", {
@@ -371,6 +382,9 @@ test("npm pack excludes NVX runtime and validation payloads without removing sup
   assert.equal(unfiltered.status, 0, unfiltered.stdout + unfiltered.stderr);
   const unfilteredFiles = JSON.parse(unfiltered.stdout)[0].files.map(({ path }) => path);
   assert.ok(unfilteredFiles.includes("bin/x64/nvx-e2e-tests.exe"));
+  for (const { arch, name } of probeSuites) {
+    assert.ok(unfilteredFiles.includes(`bin/${arch}/${name}`));
+  }
   assert.deepEqual(
     unfilteredFiles
       .filter((path) => path.startsWith("bin/x64/aci-edge-sandboxes/"))

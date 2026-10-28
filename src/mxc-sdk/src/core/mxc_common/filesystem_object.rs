@@ -87,6 +87,10 @@ pub enum ExistingObjectComparison {
 #[cfg(unix)]
 fn resolve_object(path: &Path) -> PathResolution {
     use std::os::unix::fs::MetadataExt;
+
+    #[cfg(test)]
+    super::filesystem_probe::launch_tests::stall("object", path);
+
     // `metadata` follows symlinks, giving the target object's identity.
     match std::fs::metadata(path) {
         Ok(md) => PathResolution::Object(ObjectId {
@@ -115,6 +119,9 @@ fn resolve_object(path: &Path) -> PathResolution {
         FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         OPEN_EXISTING,
     };
+
+    #[cfg(test)]
+    super::filesystem_probe::launch_tests::stall("object", path);
 
     let wide: Vec<u16> = path
         .as_os_str()

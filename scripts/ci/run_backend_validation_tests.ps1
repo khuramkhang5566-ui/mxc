@@ -323,6 +323,18 @@ function Invoke-WslcSuites {
     $env:MXC_ENABLE_WSLC_TESTS = '1'
 
     Invoke-NamedSuites -Backend 'wslc' -Suites ([ordered]@{
+        'filesystem probe deadlines' = {
+            $tests = Join-Path $binaryDirectoryPath 'mxc-filesystem-probe-tests.exe'
+            Assert-File -Path $tests
+            $listed = @(& $tests --list --ignored)
+            if ($LASTEXITCODE -ne 0) { throw 'Listing filesystem probe tests failed.' }
+            foreach ($case in 'wslc_launch', 'wslc_provision') {
+                $name = "core_modules::mxc_common::filesystem_probe::launch_tests::scenarios::${case}_rejects_stalled_paths"
+                if ($listed -notcontains "${name}: test") { throw "Missing regression: $name" }
+            }
+            & $tests --ignored filesystem_probe::launch_tests:: | Out-Host
+            if ($LASTEXITCODE -ne 0) { "exited $LASTEXITCODE" }
+        }
         'command line' = {
             $global:LASTEXITCODE = 0
             & (Join-Path $testScriptRoot 'run_wslc_all_tests.ps1') -WxcExecPath $wxc | Out-Host

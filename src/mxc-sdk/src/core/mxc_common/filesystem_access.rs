@@ -67,6 +67,9 @@ impl AccessMode {
 fn user_can_access(path: &str, mode: AccessMode) -> Option<bool> {
     use std::ffi::CString;
 
+    #[cfg(test)]
+    super::filesystem_probe::launch_tests::stall("delegation", path);
+
     let c_path = CString::new(path).ok()?;
     let mask = match mode {
         AccessMode::Read => libc::R_OK,
@@ -99,6 +102,9 @@ fn user_can_access(path: &str, mode: AccessMode) -> Option<bool> {
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
+
+    #[cfg(test)]
+    super::filesystem_probe::launch_tests::stall("delegation", path);
 
     // Probe the caller's effective access by asking the OS to open the object
     // with the required rights. FILE_FLAG_BACKUP_SEMANTICS lets the same call

@@ -1065,7 +1065,11 @@ fn normalize_filesystem_paths(
 ) -> Result<(), WxcError> {
     let mut probe = crate::mxc_common::filesystem_probe::FilesystemProbe::default();
     normalize_filesystem_paths_with(policy, logger, |path| {
-        probe.run(path, |path| fs::metadata(path).is_err())
+        probe.run(path, |path| {
+            #[cfg(test)]
+            crate::mxc_common::filesystem_probe::launch_tests::stall("parser", path);
+            fs::metadata(path).is_err()
+        })
     })
 }
 
