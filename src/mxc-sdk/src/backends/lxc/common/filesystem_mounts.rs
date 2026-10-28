@@ -3,6 +3,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::mxc_common::filesystem_probe::FilesystemProbe;
 use crate::mxc_common::filesystem_resolve::{resolve_mount_order, FsIntent};
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::ContainerPolicy;
@@ -115,14 +116,18 @@ pub fn configure_filesystem_mounts(
     policy: &ContainerPolicy,
     logger: &mut Logger,
 ) -> Result<(), String> {
+    let mut probe = FilesystemProbe::default();
     let mounts = resolve_mount_order(policy);
     let mut entries: Vec<String> = Vec::new();
 
-    let rebound_container_paths: Vec<String> = mounts
+    let mut rebound_container_paths = Vec::new();
+    for mount in mounts
         .iter()
         .filter(|m| matches!(m.intent, FsIntent::ReadWrite | FsIntent::ReadOnly))
-        .flat_map(|m| rebound_comparison_paths(&m.path))
-        .collect();
+    {
+        validate_path(&mount.path)?;
+        rebound_container_paths.extend(probe.run(&mount.path, rebound_comparison_paths)?);
+    }
 
     for mount in &mounts {
         let host_path = &mount.path;
@@ -147,7 +152,11 @@ pub fn configure_filesystem_mounts(
                 entries.push(mount_entry);
             }
             FsIntent::Denied => {
-                let real_host = resolve_denied_host_path(host_path)?;
+                let (real_host, is_file) = probe.run(host_path, |path| {
+                    let real_host = resolve_denied_host_path(path)?;
+                    let is_file = denied_path_is_file(&real_host);
+                    Ok::<_, String>((real_host, is_file))
+                })??;
                 if real_host != *host_path {
                     logger.log_line(&format!(
                         "Denied path {} resolves through a symlink; masking its real target {}",
@@ -156,10 +165,6 @@ pub fn configure_filesystem_mounts(
                 }
                 validate_path(&real_host)?;
                 let container_path = real_host.trim_start_matches('/');
-
-                // The container rootfs does not exist until mounts are applied,
-                // so the mask type is read off the host path instead.
-                let is_file = denied_path_is_file(&real_host);
 
                 let mount_entry = if is_file {
                     MASK_FILE.entry("/dev/null", container_path)

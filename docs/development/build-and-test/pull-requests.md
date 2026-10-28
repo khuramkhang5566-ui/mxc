@@ -21,6 +21,20 @@ regressions also reject empty selections and skipped SDK streaming cases.
 These checks do not require PSEC; scheduled ProcessContainer hosts execute the
 prebuilt public SDK streaming tests from the Windows SDK test bundle.
 
+### Native module lifetime regression
+
+From `src`, run:
+
+```text
+cargo build --locked -p mxc-sdk --example module_lifetime_fixture
+cargo test --locked -p mxc-sdk --test module_lifetime
+```
+
+The test closes a native library after a worker times out, then releases the
+worker and checks that it can finish. It runs in a subprocess so an unload
+regression cannot crash the test runner. The full native Cargo test suites also
+build the fixture example and run this test on Windows, Linux, and macOS.
+
 ### Local Node SDK package validation
 
 From `sdk/node`, run `npm run typecheck` before pushing SDK changes. It builds

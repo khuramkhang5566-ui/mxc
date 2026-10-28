@@ -1059,24 +1059,27 @@ fn validate_paths(paths: &[String]) -> Result<(), WxcError> {
     Ok(())
 }
 
-/// Normalizes cross-list filesystem path constraints by applying
-/// **most-restrictive-wins** precedence (`deny` > `readonly` > `readwrite`):
-///
-/// 1. Same-path conflict: if a path string appears in multiple lists, it is kept
-///    only in the most restrictive list (e.g. a path in both `readwritePaths` and
-///    `deniedPaths` is normalized to denied).
-/// 2. Paths should exist: logs a WARNING for paths that don't exist on the host
-///    (advisory — some backends create mount targets dynamically; not a hard error).
-///
-/// This never rejects the config — conflicting intents are resolved deterministically
-/// rather than erroring, matching the roadmap's most-restrictive-wins decision.
-fn normalize_filesystem_paths(policy: &mut ContainerPolicy, logger: &mut Logger) {
+fn normalize_filesystem_paths(
+    policy: &mut ContainerPolicy,
+    logger: &mut Logger,
+) -> Result<(), WxcError> {
+    let mut probe = crate::mxc_common::filesystem_probe::FilesystemProbe::default();
+    normalize_filesystem_paths_with(policy, logger, |path| {
+        probe.run(path, |path| fs::metadata(path).is_err())
+    })
+}
+
+fn normalize_filesystem_paths_with(
+    policy: &mut ContainerPolicy,
+    logger: &mut Logger,
+    mut path_missing: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<(), WxcError> {
     if policy.readwrite_paths.is_empty()
         && policy.readonly_paths.is_empty()
         && policy.enumerate_paths.is_empty()
         && policy.denied_paths.is_empty()
     {
-        return;
+        return Ok(());
     }
 
     // 1. Same-path (string) conflict: drop a path from a list if it also appears
@@ -1148,14 +1151,13 @@ fn normalize_filesystem_paths(policy: &mut ContainerPolicy, logger: &mut Logger)
         }
     });
 
-    // 2. Existence warning (advisory; not a hard gate).
     for (paths, list_name) in [
         (&policy.readwrite_paths, "readwritePaths"),
         (&policy.readonly_paths, "readonlyPaths"),
         (&policy.denied_paths, "deniedPaths"),
     ] {
         for path in paths {
-            if fs::metadata(path).is_err() {
+            if path_missing(path).map_err(WxcError::ConfigParse)? {
                 logger.log_line(&format!(
                     "WARNING: filesystem path '{}' (in '{}') does not exist on the host; \
                      the backend may fail at mount time",
@@ -1165,6 +1167,7 @@ fn normalize_filesystem_paths(policy: &mut ContainerPolicy, logger: &mut Logger)
             }
         }
     }
+    Ok(())
 }
 
 // ---------- Conversion from normalized config input to runtime model ----------
@@ -1574,7 +1577,7 @@ fn normalize_common_request_ir(
         }
     }
     validate_filesystem_paths(&policy)?;
-    normalize_filesystem_paths(&mut policy, logger);
+    normalize_filesystem_paths(&mut policy, logger)?;
 
     parse_network_policy(
         &mut policy,
@@ -1795,6 +1798,42 @@ mod tests {
             flag: "--session-id",
             value,
         }
+    }
+
+    #[test]
+    fn filesystem_probe_failure_is_not_a_missing_path_warning() {
+        let mut policy = ContainerPolicy {
+            denied_paths: vec!["slow".to_string()],
+            ..Default::default()
+        };
+        let mut logger = test_logger();
+        let error = normalize_filesystem_paths_with(&mut policy, &mut logger, |path| {
+            Err(format!("probe for {path} timed out"))
+        })
+        .unwrap_err();
+        assert!(matches!(error, WxcError::ConfigParse(_)));
+        assert!(error.to_string().contains("probe for slow timed out"));
+        assert!(logger.get_buffer().is_empty());
+    }
+
+    #[test]
+    fn filesystem_normalization_preserves_missing_path_warnings() {
+        let mut policy = ContainerPolicy {
+            readwrite_paths: vec!["missing".to_string()],
+            readonly_paths: vec!["missing".to_string()],
+            ..Default::default()
+        };
+        let mut logger = test_logger();
+        let mut probes = 0;
+        normalize_filesystem_paths_with(&mut policy, &mut logger, |_| {
+            probes += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert!(policy.readwrite_paths.is_empty());
+        assert_eq!(policy.readonly_paths, ["missing"]);
+        assert_eq!(probes, 1);
+        assert!(logger.get_buffer().contains("does not exist on the host"));
     }
 
     fn repository_root() -> PathBuf {

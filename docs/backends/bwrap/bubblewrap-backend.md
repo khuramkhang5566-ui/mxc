@@ -319,6 +319,10 @@ whatever MXC passed.
 
 ### Filesystem Policy
 
+Policy validation and denied-path resolution use the shared
+[filesystem probe deadlines](../../schema.md#filesystem-probe-timeouts).
+A stalled probe rejects startup rather than leaving a policy check unenforced.
+
 | Field | bwrap Mapping | Description |
 |-------|---------------|-------------|
 | `readwritePaths` | `--bind <path> <path>` | Read-write bind mount (overrides base RO) |

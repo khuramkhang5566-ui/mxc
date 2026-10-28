@@ -623,6 +623,11 @@ Paths in `filesystem.readwritePaths` and `filesystem.readonlyPaths` are mounted
 into the container. Host path `C:\workspace` becomes `/mnt/c/workspace` inside
 the container.
 
+Create-and-run execution and container lifecycle provisioning use the shared
+[filesystem probe deadlines](../../schema.md#filesystem-probe-timeouts) for
+object identity, delegation, and denied-path overlap checks. A stalled probe
+rejects the request before volumes are created.
+
 ### Working directory (`process.cwd`)
 
 Create-and-run execution takes `process.cwd` as a local Windows drive path and maps it the
